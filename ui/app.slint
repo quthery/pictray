@@ -1,0 +1,467 @@
+import { ScrollView } from "std-widgets.slint";
+
+export struct ImageTile {
+    title: string,
+    subtitle: string,
+    thumbnail: image,
+}
+
+component Tile inherits Rectangle {
+    in property <ImageTile> data;
+    in property <int> index;
+    in property <bool> selected: false;
+    callback copy-requested(int);
+    callback delete-requested(int);
+    callback select-requested(int);
+
+    border-radius: 18px;
+    background: #0b0d11;
+    width: 100%;
+    height: selected ? 214px : 168px;
+    border-width: 1px;
+    border-color: selected ? #f2ead57a : hover-touch.has-hover ? #f2ead55c : #f2ead51f;
+    clip: true;
+    animate height { duration: 140ms; easing: ease-out; }
+    animate border-color { duration: 140ms; easing: ease-out; }
+
+    hover-touch := TouchArea {
+        mouse-cursor: MouseCursor.default;
+        clicked => {
+            root.select-requested(root.index);
+        }
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            background: #090b0f;
+
+            Image {
+                source: data.thumbnail;
+                image-fit: selected ? contain : cover;
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+                animate x, y, width, height { duration: 140ms; easing: ease-out; }
+            }
+        }
+
+        if hover-touch.has-hover && !selected : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            background: #06090fb0;
+            animate background { duration: 120ms; easing: ease-out; }
+
+            Rectangle {
+                x: 12px;
+                y: 12px;
+                width: parent.width - 24px;
+                height: 36px;
+                background: #00000000;
+
+                VerticalLayout {
+                    spacing: 2px;
+
+                    Text {
+                        text: data.title;
+                        color: #faf6ee;
+                        font-size: 13px;
+                        font-weight: 700;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: data.subtitle;
+                        color: #d0cabf;
+                        font-size: 11px;
+                        font-weight: 500;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            Rectangle {
+                x: parent.width - 204px;
+                y: parent.height - 44px;
+                width: 192px;
+                height: 32px;
+                background: #00000000;
+
+                HorizontalLayout {
+                    spacing: 6px;
+
+                    Rectangle {
+                        width: 60px;
+                        height: 32px;
+                        border-radius: 16px;
+                        border-width: 1px;
+                        border-color: preview-touch.has-hover ? #f7efdd88 : #f7efdd44;
+                        background: preview-touch.pressed ? #f7efddea : #0c101766;
+
+                        Text {
+                            text: "Preview";
+                            color: preview-touch.pressed ? #17181d : #f7efdd;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        preview-touch := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                root.select-requested(root.index);
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 60px;
+                        height: 32px;
+                        border-radius: 16px;
+                        border-width: 1px;
+                        border-color: copy-touch.has-hover || selected ? #f7efdd88 : #f7efdd44;
+                        background: copy-touch.pressed ? #f7efddea : selected ? #0c1017aa : #0c101766;
+
+                        Text {
+                            text: "Copy";
+                            color: copy-touch.pressed ? #17181d : #f7efdd;
+                            font-size: 12px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        copy-touch := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                root.copy-requested(root.index);
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 60px;
+                        height: 32px;
+                        border-radius: 16px;
+                        border-width: 1px;
+                        border-color: delete-touch.has-hover || selected ? #c8cedb88 : #c8cedb33;
+                        background: delete-touch.pressed ? #c8cedbe6 : selected ? #0c1017aa : #0c101766;
+
+                        Text {
+                            text: "Delete";
+                            color: delete-touch.pressed ? #17181d : #f3efe7;
+                            font-size: 12px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        delete-touch := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                root.delete-requested(root.index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Pictray";
+    width: 320px;
+    height: 452px;
+    no-frame: true;
+    always-on-top: true;
+    background: #00000000;
+
+    in property <[ImageTile]> images;
+    in property <string> status-text: "Watching clipboard for images";
+    in property <bool> drop-active: false;
+    in property <bool> show-clear-confirmation: false;
+    in property <int> selected-index: -1;
+    callback copy-image(int);
+    callback delete-image(int);
+    callback select-image(int);
+    callback begin-window-drag();
+    callback clear-all();
+    callback confirm-clear-all();
+    callback cancel-clear-all();
+    callback hide-window();
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        border-radius: 26px;
+        background: #111318f0;
+        clip: true;
+
+        VerticalLayout {
+            padding: 10px;
+            spacing: 10px;
+
+            Rectangle {
+                height: 6px;
+                background: #00000000;
+
+                Rectangle {
+                    x: (parent.width - 52px) / 2;
+                    y: 0px;
+                    width: 52px;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: drag-touch.pressed ? #f1e7d4aa : #f1e7d466;
+                }
+
+                drag-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                            root.begin-window-drag();
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                height: 38px;
+                spacing: 8px;
+
+                Rectangle {
+                    border-radius: 16px;
+                    background: copy-latest-touch.pressed ? #efe7d6 : #ddcfb8;
+
+                    Text {
+                        text: "Copy latest";
+                        color: #17181d;
+                        font-size: 13px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    copy-latest-touch := TouchArea {
+                        clicked => {
+                            root.copy-image(0);
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 66px;
+                    border-radius: 16px;
+                    background: clear-touch.pressed ? #343842 : #252931;
+
+                    Text {
+                        text: "Clear";
+                        color: #f4efe6;
+                        font-size: 13px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    clear-touch := TouchArea {
+                        clicked => {
+                            root.clear-all();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 66px;
+                    border-radius: 16px;
+                    background: hide-touch.pressed ? #343842 : #252931;
+
+                    Text {
+                        text: "Hide";
+                        color: #f4efe6;
+                        font-size: 13px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+
+                    hide-touch := TouchArea {
+                        clicked => {
+                            root.hide-window();
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                height: 22px;
+                spacing: 8px;
+                alignment: center;
+
+                Text {
+                    text: images.length == 0 ? "Ready" : images.length + " buffered";
+                    color: #aeb2bf;
+                    font-size: 11px;
+                    font-weight: 600;
+                }
+
+                Text {
+                    text: root.status-text;
+                    color: #f6f2eb;
+                    font-size: 12px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+            }
+
+            if images.length == 0 : Rectangle {
+                border-radius: 22px;
+                background: #181a20e8;
+
+                Text {
+                    text: "No stored images";
+                    color: #b0b4c1;
+                    font-size: 13px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            if images.length > 0 : ScrollView {
+                VerticalLayout {
+                    spacing: 8px;
+
+                    for tile[index] in root.images : Tile {
+                        data: tile;
+                        index: index;
+                        selected: root.selected-index == index;
+                        copy-requested(index) => {
+                            root.copy-image(index);
+                        }
+                        delete-requested(index) => {
+                            root.delete-image(index);
+                        }
+                        select-requested(index) => {
+                            root.select-image(index);
+                        }
+                    }
+                }
+            }
+
+        }
+
+        if root.drop-active : Rectangle {
+            x: 14px;
+            y: 14px;
+            width: parent.width - 28px;
+            height: parent.height - 28px;
+            border-radius: 22px;
+            background: #d9c8ab22;
+            border-width: 1px;
+            border-color: #d9c8ab66;
+
+            Text {
+                text: "Drop image or GIF to add";
+                color: #f4ede2;
+                font-size: 15px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.show-clear-confirmation : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            background: #040608cc;
+
+            blocker-touch := TouchArea {}
+
+            Rectangle {
+                x: 22px;
+                y: 136px;
+                width: parent.width - 44px;
+                height: 132px;
+                border-radius: 22px;
+                background: #141821f4;
+                border-width: 1px;
+                border-color: #f1e7d42a;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 14px;
+
+                    Text {
+                        text: "Clear buffer?";
+                        color: #faf6ee;
+                        font-size: 16px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: "This removes all stored images and GIFs from the current buffer.";
+                        color: #c7c2b8;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle {
+                            height: 34px;
+                            border-radius: 17px;
+                            background: cancel-clear-touch.pressed ? #f3ecde : #252a33;
+
+                            Text {
+                                text: "Cancel";
+                                color: cancel-clear-touch.pressed ? #17181d : #f3efe7;
+                                font-size: 12px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            cancel-clear-touch := TouchArea {
+                                clicked => {
+                                    root.cancel-clear-all();
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 34px;
+                            border-radius: 17px;
+                            background: confirm-clear-touch.pressed ? #f3ecde : #e2d0b2;
+
+                            Text {
+                                text: "Clear";
+                                color: #17181d;
+                                font-size: 12px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            confirm-clear-touch := TouchArea {
+                                clicked => {
+                                    root.confirm-clear-all();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
