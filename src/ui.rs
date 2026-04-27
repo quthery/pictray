@@ -25,6 +25,15 @@ pub struct PreviewDriver {
     _timer: Timer,
 }
 
+pub fn ensure_window_stays_on_top(ui: &MainWindow) {
+    let _ = ui
+        .window()
+        .with_winit_window(|window: &winit::window::Window| {
+            // Re-assert the native window level when the tray shows the panel again.
+            window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
+        });
+}
+
 #[derive(Default)]
 struct PreviewState {
     records: Vec<StoredImage>,
@@ -34,6 +43,10 @@ struct PreviewState {
 struct CachedTile {
     title: SharedString,
     subtitle: SharedString,
+    badge: SharedString,
+    preview: SharedString,
+    line_numbers: SharedString,
+    is_text: bool,
     image: CachedTileImage,
 }
 
@@ -83,6 +96,10 @@ impl PreviewState {
             .map(|tile| ImageTile {
                 title: tile.title.clone(),
                 subtitle: tile.subtitle.clone(),
+                badge: tile.badge.clone(),
+                preview: tile.preview.clone(),
+                line_numbers: tile.line_numbers.clone(),
+                is_text: tile.is_text,
                 thumbnail: tile.current_image(),
             })
             .collect()
@@ -129,7 +146,7 @@ pub fn install_ui_callbacks(
     ui.on_copy_image(move |index| {
         let status = match copy_store.lock() {
             Ok(store) => match store.copy_to_clipboard(index as usize) {
-                Ok(()) => "Copied image back to clipboard.".to_owned(),
+                Ok(()) => "Copied item back to clipboard.".to_owned(),
                 Err(err) => format!("Copy failed: {err:#}"),
             },
             Err(_) => "Copy failed: storage lock is poisoned.".to_owned(),
@@ -140,6 +157,22 @@ pub fn install_ui_callbacks(
         }
 
         let _ = copy_tx.send(AppEvent::StorageChanged);
+    });
+
+    let inspect_store = Arc::clone(&store);
+    let inspect_ui_weak = ui.as_weak();
+    ui.on_inspect_image(move |index| {
+        let status = match inspect_store.lock() {
+            Ok(store) => match store.reveal_in_file_manager(index as usize) {
+                Ok(()) => "Revealed item in file browser.".to_owned(),
+                Err(err) => format!("Inspect failed: {err:#}"),
+            },
+            Err(_) => "Inspect failed: storage lock is poisoned.".to_owned(),
+        };
+
+        if let Some(ui) = inspect_ui_weak.upgrade() {
+            ui.set_status_text(status.into());
+        }
     });
 
     let delete_store = Arc::clone(&store);
@@ -209,6 +242,7 @@ pub fn start_event_bridge(
                                 if !ui.window().is_visible() {
                                     let _ = ui.show();
                                 }
+                                ensure_window_stays_on_top(&ui);
                                 if let Some(anchor) = anchor {
                                     place_window_near_anchor(&ui, anchor);
                                 }
@@ -227,6 +261,7 @@ pub fn start_event_bridge(
                                 let _ = ui.hide();
                             } else {
                                 let _ = ui.show();
+                                ensure_window_stays_on_top(&ui);
                                 if let Some(anchor) = anchor {
                                     place_window_near_anchor(&ui, anchor);
                                 }
@@ -241,8 +276,8 @@ pub fn start_event_bridge(
                 AppEvent::CopyLatest => {
                     let status = match store.lock() {
                         Ok(store) => match store.copy_latest_to_clipboard() {
-                            Ok(true) => "Copied latest image back to clipboard.".to_owned(),
-                            Ok(false) => "No stored image is available yet.".to_owned(),
+                            Ok(true) => "Copied latest item back to clipboard.".to_owned(),
+                            Ok(false) => "No stored item is available yet.".to_owned(),
                             Err(err) => format!("Copy failed: {err:#}"),
                         },
                         Err(_) => "Copy failed: storage lock is poisoned.".to_owned(),
@@ -262,7 +297,7 @@ pub fn start_event_bridge(
                     let ui_weak = ui_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_status_text("0 image(s) in hot storage.".into());
+                            ui.set_status_text("0 item(s) in hot storage.".into());
                         }
                     });
                 }
@@ -271,7 +306,7 @@ pub fn start_event_bridge(
                         Ok(store) => store.records().len(),
                         Err(_) => 0,
                     };
-                    let status = format!("{count} image(s) in hot storage.");
+                    let status = format!("{count} item(s) in hot storage.");
 
                     let ui_weak = ui_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -325,23 +360,86 @@ fn refresh_previews(
 
 fn load_tile_preview(record: &StoredImage) -> CachedTile {
     let title = record.display_name.clone().into();
+    let badge: SharedString = match record.kind {
+        StoredImageKind::Gif => "GIF".into(),
+        StoredImageKind::Raster => record.file_extension.to_ascii_uppercase().into(),
+        StoredImageKind::Text => text_file_badge(record).into(),
+    };
     let subtitle = match record.kind {
         StoredImageKind::Gif => format!("{}x{} GIF", record.width, record.height).into(),
         StoredImageKind::Raster => format!("{}x{}", record.width, record.height).into(),
+        StoredImageKind::Text => text_file_subtitle(record).into(),
     };
-
-    let image = if record.kind == StoredImageKind::Gif {
-        load_animated_preview(record)
-            .map(CachedTileImage::Animated)
-            .unwrap_or_else(|| CachedTileImage::Static(load_static_preview_image(record)))
+    let preview: SharedString = record.text_preview.clone().into();
+    let line_numbers: SharedString = if record.kind == StoredImageKind::Text {
+        preview_line_numbers(&record.text_preview).into()
     } else {
-        CachedTileImage::Static(load_static_preview_image(record))
+        SharedString::default()
+    };
+    let is_text = record.kind == StoredImageKind::Text;
+
+    let image = match record.kind {
+        StoredImageKind::Gif => load_animated_preview(record)
+            .map(CachedTileImage::Animated)
+            .unwrap_or_else(|| CachedTileImage::Static(load_static_preview_image(record))),
+        StoredImageKind::Raster => CachedTileImage::Static(load_static_preview_image(record)),
+        StoredImageKind::Text => CachedTileImage::Static(Image::default()),
     };
 
     CachedTile {
         title,
         subtitle,
+        badge,
+        preview,
+        line_numbers,
+        is_text,
         image,
+    }
+}
+
+fn text_file_badge(record: &StoredImage) -> String {
+    let normalized = match record.file_extension.as_str() {
+        "markdown" => "md",
+        "text" => "txt",
+        extension => extension,
+    };
+    normalized
+        .chars()
+        .take(4)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn text_file_subtitle(record: &StoredImage) -> String {
+    let file_kind = text_file_badge(record);
+    let line_label = if record.line_count == 1 {
+        "line"
+    } else {
+        "lines"
+    };
+    format!(
+        "{file_kind} • {} {line_label} • {}",
+        record.line_count,
+        format_byte_len(record.byte_len),
+    )
+}
+
+fn preview_line_numbers(preview: &str) -> String {
+    let line_count = preview.lines().count().max(1);
+
+    (1..=line_count)
+        .map(|line| format!("{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_byte_len(byte_len: u64) -> String {
+    if byte_len < 1024 {
+        format!("{byte_len} B")
+    } else if byte_len < 1024 * 1024 {
+        format!("{:.1} KB", byte_len as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", byte_len as f64 / (1024.0 * 1024.0))
     }
 }
 

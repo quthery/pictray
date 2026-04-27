@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     time::SystemTime,
 };
 
@@ -13,6 +14,13 @@ use image::{RgbaImage, imageops};
 pub enum StoredImageKind {
     Raster,
     Gif,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    Copy,
+    Move,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,11 +31,20 @@ pub struct StoredImage {
     pub height: u32,
     pub kind: StoredImageKind,
     pub original_path: PathBuf,
-    pub thumbnail_path: PathBuf,
+    pub thumbnail_path: Option<PathBuf>,
+    pub text_preview: String,
+    pub line_count: usize,
+    pub byte_len: u64,
+    pub file_extension: String,
 }
 
 impl StoredImage {
     pub fn preview_rgba(&self) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        anyhow::ensure!(
+            self.kind != StoredImageKind::Text,
+            "text files do not expose image previews",
+        );
+
         let rgba = image::open(&self.original_path)
             .with_context(|| format!("failed to open preview {}", self.original_path.display()))?
             .to_rgba8();
@@ -93,6 +110,20 @@ impl ImageStore {
     }
 
     pub fn add_image_file(&mut self, path: &Path) -> anyhow::Result<bool> {
+        self.add_image_file_with_mode(path, ImportMode::Copy)
+    }
+
+    pub fn import_path(&mut self, path: &Path, mode: ImportMode) -> anyhow::Result<bool> {
+        if is_supported_image_file(path) {
+            self.add_image_file_with_mode(path, mode)
+        } else if looks_like_supported_text_path(path) || file_contains_text(path)? {
+            self.add_text_file(path, mode)
+        } else {
+            anyhow::bail!("{} is not a supported image or text file", path.display());
+        }
+    }
+
+    fn add_image_file_with_mode(&mut self, path: &Path, mode: ImportMode) -> anyhow::Result<bool> {
         let display_name = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -100,14 +131,81 @@ impl ImageStore {
             .filter(|name| !name.is_empty())
             .unwrap_or("Imported image");
 
-        if is_gif_file(path) {
+        let stored = if is_gif_file(path) {
             self.persist_gif_image(path, display_name)
         } else {
             let rgba_image = image::open(path)
                 .with_context(|| format!("failed to decode {}", path.display()))?
                 .to_rgba8();
             self.persist_rgba_image(rgba_image, display_name)
+        }?;
+
+        if stored && should_remove_source(path, mode, &self.root) {
+            remove_file_if_exists(path.to_path_buf())?;
         }
+
+        Ok(stored)
+    }
+
+    fn add_text_file(&mut self, path: &Path, mode: ImportMode) -> anyhow::Result<bool> {
+        let encoded =
+            fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        anyhow::ensure!(
+            looks_like_text_bytes(&encoded),
+            "{} does not look like a text file",
+            path.display(),
+        );
+
+        let text = std::str::from_utf8(&encoded)
+            .with_context(|| format!("{} is not valid UTF-8 text", path.display()))?;
+        let hash = blake3::hash(&encoded).to_hex().to_string();
+
+        if self.promote_existing(&hash) {
+            if should_remove_source(path, mode, &self.root) {
+                remove_file_if_exists(path.to_path_buf())?;
+            }
+            return Ok(true);
+        }
+
+        let display_name = normalize_display_name(
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Text file"),
+        );
+        let file_extension = normalized_text_extension(path);
+        let original_path = self
+            .originals_dir
+            .join(format!("{hash}.{}", persisted_text_extension(path)));
+        let metadata_path = self.metadata_dir.join(format!("{hash}.txt"));
+
+        if should_remove_source(path, mode, &self.root) {
+            move_file(path, &original_path)?;
+        } else {
+            fs::write(&original_path, &encoded)
+                .with_context(|| format!("failed to save {}", original_path.display()))?;
+        }
+
+        fs::write(&metadata_path, &display_name)
+            .with_context(|| format!("failed to save {}", metadata_path.display()))?;
+
+        self.records.insert(
+            0,
+            StoredImage {
+                hash,
+                display_name,
+                width: 0,
+                height: 0,
+                kind: StoredImageKind::Text,
+                original_path,
+                thumbnail_path: None,
+                text_preview: build_text_preview(text),
+                line_count: text.lines().count(),
+                byte_len: encoded.len() as u64,
+                file_extension,
+            },
+        );
+
+        Ok(true)
     }
 
     fn persist_gif_image(&mut self, path: &Path, display_name: &str) -> anyhow::Result<bool> {
@@ -148,7 +246,11 @@ impl ImageStore {
                 height,
                 kind: StoredImageKind::Gif,
                 original_path,
-                thumbnail_path,
+                thumbnail_path: Some(thumbnail_path),
+                text_preview: String::new(),
+                line_count: 0,
+                byte_len: encoded.len() as u64,
+                file_extension: "gif".to_owned(),
             },
         );
 
@@ -192,7 +294,11 @@ impl ImageStore {
                 height,
                 kind: StoredImageKind::Raster,
                 original_path,
-                thumbnail_path,
+                thumbnail_path: Some(thumbnail_path),
+                text_preview: String::new(),
+                line_count: 0,
+                byte_len: rgba_image.as_raw().len() as u64,
+                file_extension: "png".to_owned(),
             },
         );
 
@@ -204,16 +310,26 @@ impl ImageStore {
             .records
             .get(index)
             .ok_or_else(|| anyhow!("image index {index} does not exist"))?;
-        let rgba = image::open(&record.original_path)
-            .with_context(|| format!("failed to open {}", record.original_path.display()))?
-            .to_rgba8();
-
         let mut clipboard = Clipboard::new()?;
-        clipboard.set_image(ImageData {
-            width: rgba.width() as usize,
-            height: rgba.height() as usize,
-            bytes: Cow::Owned(rgba.into_raw()),
-        })?;
+
+        match record.kind {
+            StoredImageKind::Text => {
+                let text = fs::read_to_string(&record.original_path).with_context(|| {
+                    format!("failed to open {}", record.original_path.display())
+                })?;
+                clipboard.set_text(text)?;
+            }
+            StoredImageKind::Gif | StoredImageKind::Raster => {
+                let rgba = image::open(&record.original_path)
+                    .with_context(|| format!("failed to open {}", record.original_path.display()))?
+                    .to_rgba8();
+                clipboard.set_image(ImageData {
+                    width: rgba.width() as usize,
+                    height: rgba.height() as usize,
+                    bytes: Cow::Owned(rgba.into_raw()),
+                })?;
+            }
+        }
 
         Ok(())
     }
@@ -227,6 +343,14 @@ impl ImageStore {
         Ok(true)
     }
 
+    pub fn reveal_in_file_manager(&self, index: usize) -> anyhow::Result<()> {
+        let record = self
+            .records
+            .get(index)
+            .ok_or_else(|| anyhow!("item index {index} does not exist"))?;
+        reveal_path_in_file_manager(&record.original_path)
+    }
+
     pub fn delete(&mut self, index: usize) -> anyhow::Result<()> {
         if index >= self.records.len() {
             return Ok(());
@@ -234,7 +358,9 @@ impl ImageStore {
 
         let record = self.records.remove(index);
         remove_file_if_exists(record.original_path)?;
-        remove_file_if_exists(record.thumbnail_path)?;
+        if let Some(thumbnail_path) = record.thumbnail_path {
+            remove_file_if_exists(thumbnail_path)?;
+        }
         remove_file_if_exists(self.metadata_dir.join(format!("{}.txt", record.hash)))?;
         Ok(())
     }
@@ -242,7 +368,9 @@ impl ImageStore {
     pub fn clear(&mut self) -> anyhow::Result<()> {
         for record in self.records.drain(..) {
             remove_file_if_exists(record.original_path)?;
-            remove_file_if_exists(record.thumbnail_path)?;
+            if let Some(thumbnail_path) = record.thumbnail_path {
+                remove_file_if_exists(thumbnail_path)?;
+            }
             remove_file_if_exists(self.metadata_dir.join(format!("{}.txt", record.hash)))?;
         }
         Ok(())
@@ -279,6 +407,59 @@ fn remove_file_if_exists(path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
+fn reveal_path_in_file_manager(path: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .status()
+            .with_context(|| format!("failed to reveal {}", path.display()))?;
+        anyhow::ensure!(status.success(), "failed to reveal {}", path.display());
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("explorer")
+            .arg("/select,")
+            .arg(path)
+            .status()
+            .with_context(|| format!("failed to reveal {}", path.display()))?;
+        anyhow::ensure!(status.success(), "failed to reveal {}", path.display());
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target_dir = path.parent().unwrap_or(path);
+        let status = Command::new("xdg-open")
+            .arg(target_dir)
+            .status()
+            .with_context(|| format!("failed to open {}", target_dir.display()))?;
+        anyhow::ensure!(status.success(), "failed to open {}", target_dir.display());
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!("revealing files is not supported on this platform"))
+}
+
+fn move_file(from: &Path, to: &Path) -> anyhow::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(from, to).with_context(|| format!("failed to save {}", to.display()))?;
+            remove_file_if_exists(from.to_path_buf())?;
+            Ok(())
+        }
+    }
+}
+
+fn should_remove_source(path: &Path, mode: ImportMode, store_root: &Path) -> bool {
+    mode == ImportMode::Move && !path.starts_with(store_root)
+}
+
 pub fn image_fingerprint(width: usize, height: usize, bytes: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&width.to_le_bytes());
@@ -300,7 +481,7 @@ fn load_records(
         let entry = entry?;
         let path = entry.path();
 
-        if !entry.file_type()?.is_file() || !is_supported_original_file(&path) {
+        if !entry.file_type()?.is_file() {
             continue;
         }
 
@@ -330,6 +511,10 @@ fn load_record(
     let Some(hash) = original_path.file_stem().and_then(|stem| stem.to_str()) else {
         return Ok(None);
     };
+
+    if is_text_file(original_path) {
+        return load_text_record(hash, original_path, metadata_dir);
+    }
 
     let rgba = image::open(original_path)
         .with_context(|| format!("failed to decode {}", original_path.display()))?
@@ -362,13 +547,73 @@ fn load_record(
             height: rgba.height(),
             kind,
             original_path: original_path.to_path_buf(),
-            thumbnail_path,
+            thumbnail_path: Some(thumbnail_path),
+            text_preview: String::new(),
+            line_count: 0,
+            byte_len: fs::metadata(original_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default(),
+            file_extension: original_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_ascii_lowercase())
+                .unwrap_or_else(|| "png".to_owned()),
         },
     )))
 }
 
-fn is_supported_original_file(path: &Path) -> bool {
-    is_png_file(path) || is_gif_file(path)
+fn load_text_record(
+    hash: &str,
+    original_path: &Path,
+    metadata_dir: &Path,
+) -> anyhow::Result<Option<(SystemTime, StoredImage)>> {
+    let encoded = fs::read(original_path)
+        .with_context(|| format!("failed to read {}", original_path.display()))?;
+    anyhow::ensure!(
+        looks_like_text_bytes(&encoded),
+        "{} is not a supported text item",
+        original_path.display(),
+    );
+    let text = std::str::from_utf8(&encoded)
+        .with_context(|| format!("{} is not valid UTF-8 text", original_path.display()))?;
+    let modified = fs::metadata(original_path)
+        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?
+        .modified()
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    Ok(Some((
+        modified,
+        StoredImage {
+            hash: hash.to_owned(),
+            display_name: load_display_name(metadata_dir.join(format!("{hash}.txt")), hash),
+            width: 0,
+            height: 0,
+            kind: StoredImageKind::Text,
+            original_path: original_path.to_path_buf(),
+            thumbnail_path: None,
+            text_preview: build_text_preview(text),
+            line_count: text.lines().count(),
+            byte_len: encoded.len() as u64,
+            file_extension: normalized_text_extension(original_path),
+        },
+    )))
+}
+
+pub fn is_supported_import_path(path: &Path) -> bool {
+    is_supported_image_file(path) || looks_like_supported_text_path(path)
+}
+
+fn is_supported_image_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase()),
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff"
+            )
+    )
 }
 
 fn is_png_file(path: &Path) -> bool {
@@ -389,19 +634,160 @@ fn is_gif_file(path: &Path) -> bool {
     )
 }
 
+fn is_text_file(path: &Path) -> bool {
+    !is_png_file(path) && !is_gif_file(path)
+}
+
+fn looks_like_supported_text_path(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    if matches!(
+        file_name,
+        "Dockerfile"
+            | "Makefile"
+            | "Justfile"
+            | "Procfile"
+            | "CMakeLists.txt"
+            | ".env"
+            | ".gitignore"
+            | ".gitattributes"
+    ) {
+        return true;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase()),
+        Some(ext)
+            if matches!(
+                ext.as_str(),
+                "txt"
+                    | "md"
+                    | "markdown"
+                    | "rst"
+                    | "log"
+                    | "csv"
+                    | "tsv"
+                    | "json"
+                    | "jsonc"
+                    | "yaml"
+                    | "yml"
+                    | "toml"
+                    | "ini"
+                    | "cfg"
+                    | "conf"
+                    | "xml"
+                    | "html"
+                    | "htm"
+                    | "css"
+                    | "scss"
+                    | "less"
+                    | "js"
+                    | "jsx"
+                    | "ts"
+                    | "tsx"
+                    | "mjs"
+                    | "cjs"
+                    | "py"
+                    | "rs"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "cc"
+                    | "cxx"
+                    | "hpp"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "swift"
+                    | "go"
+                    | "rb"
+                    | "php"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "sql"
+                    | "graphql"
+                    | "gql"
+                    | "proto"
+                    | "env"
+                    | "gitignore"
+            )
+    )
+}
+
+fn file_contains_text(path: &Path) -> anyhow::Result<bool> {
+    let encoded = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(looks_like_text_bytes(&encoded))
+}
+
+fn looks_like_text_bytes(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+fn normalized_text_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "text".to_owned())
+}
+
+fn persisted_text_extension(path: &Path) -> String {
+    normalized_text_extension(path)
+}
+
+fn build_text_preview(text: &str) -> String {
+    let mut preview = String::new();
+
+    for line in text
+        .lines()
+        .map(compact_text_preview_line)
+        .filter(|line| !line.is_empty())
+        .take(8)
+    {
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.push_str(&line);
+    }
+
+    if preview.is_empty() {
+        "Empty file".to_owned()
+    } else {
+        preview
+    }
+}
+
+fn compact_text_preview_line(line: &str) -> String {
+    let normalized = line.trim_end().replace('\t', "    ");
+    let mut chars = normalized.chars();
+    let mut clipped = chars.by_ref().take(88).collect::<String>();
+
+    if chars.next().is_some() {
+        clipped.push_str("...");
+    }
+
+    clipped
+}
+
 fn load_display_name(metadata_path: PathBuf, hash: &str) -> String {
     fs::read_to_string(&metadata_path)
         .ok()
         .map(|name| normalize_display_name(name.trim()))
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("Image {}", short_display_id(hash)))
+        .unwrap_or_else(|| format!("Item {}", short_display_id(hash)))
 }
 
 fn normalize_display_name(name: &str) -> String {
     let trimmed = name.trim();
 
     if trimmed.is_empty() {
-        "Image".to_owned()
+        "Item".to_owned()
     } else {
         trimmed.to_owned()
     }
@@ -451,6 +837,10 @@ mod tests {
 
         encoder.encode_frames(frames)?;
         Ok(())
+    }
+
+    fn write_text_file(path: &Path, contents: &str) -> anyhow::Result<()> {
+        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
     }
 
     #[test]
@@ -540,6 +930,61 @@ mod tests {
                     .and_then(|ext| ext.to_str()),
                 Some("gif")
             );
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn imported_text_file_is_preserved_and_reloaded() {
+        let root = temp_store_root();
+        let result = (|| -> anyhow::Result<()> {
+            let input_file = root.join("snippet.rs");
+            fs::create_dir_all(&root)?;
+            write_text_file(
+                &input_file,
+                "fn main() {\n    println!(\"hello from pictray\");\n}\n",
+            )?;
+
+            let mut store = ImageStore::open_at(root.join("store"))?;
+            assert!(store.import_path(&input_file, ImportMode::Copy)?);
+            assert_eq!(store.records.len(), 1);
+            assert_eq!(store.records[0].kind, StoredImageKind::Text);
+            assert_eq!(store.records[0].file_extension, "rs");
+            assert!(store.records[0].thumbnail_path.is_none());
+            assert!(store.records[0].text_preview.contains("println!"));
+            assert!(input_file.exists());
+
+            let reopened = ImageStore::open_at(root.join("store"))?;
+            assert_eq!(reopened.records.len(), 1);
+            assert_eq!(reopened.records[0].kind, StoredImageKind::Text);
+            assert_eq!(reopened.records[0].file_extension, "rs");
+            assert!(reopened.records[0].text_preview.contains("println!"));
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn moving_text_file_removes_source_after_buffering() {
+        let root = temp_store_root();
+        let result = (|| -> anyhow::Result<()> {
+            let input_file = root.join("todo.txt");
+            fs::create_dir_all(&root)?;
+            write_text_file(&input_file, "ship move support\nship copy support\n")?;
+
+            let mut store = ImageStore::open_at(root.join("store"))?;
+            assert!(store.import_path(&input_file, ImportMode::Move)?);
+            assert_eq!(store.records.len(), 1);
+            assert_eq!(store.records[0].kind, StoredImageKind::Text);
+            assert!(!input_file.exists());
+            assert!(store.records[0].original_path.exists());
 
             Ok(())
         })();

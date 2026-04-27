@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    path::Path,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -14,9 +13,12 @@ use crate::{
     MainWindow, clipboard,
     events::AppEvent,
     hotkeys, icon,
-    storage::ImageStore,
+    storage::{ImageStore, ImportMode},
     tray,
-    ui::{install_preview_driver, install_ui_callbacks, start_event_bridge},
+    ui::{
+        ensure_window_stays_on_top, install_preview_driver, install_ui_callbacks,
+        start_event_bridge,
+    },
 };
 
 pub fn run() -> anyhow::Result<()> {
@@ -31,6 +33,7 @@ pub fn run() -> anyhow::Result<()> {
     let store = Arc::new(Mutex::new(ImageStore::open()?));
     let ui = MainWindow::new().context("failed to create Slint window")?;
     install_window_icon(&ui);
+    ensure_window_stays_on_top(&ui);
 
     ui.window()
         .on_close_requested(|| CloseRequestResponse::HideWindow);
@@ -139,7 +142,7 @@ fn install_native_window_callbacks(
                 }
             }
             winit::event::WindowEvent::HoveredFile(path) => {
-                if is_supported_import_path(path) {
+                if crate::storage::is_supported_import_path(path) {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_drop_active(true);
                     }
@@ -155,17 +158,26 @@ fn install_native_window_callbacks(
                     ui.set_drop_active(false);
                 }
 
-                if is_supported_import_path(path) {
+                if crate::storage::is_supported_import_path(path) {
+                    let import_mode = if modifiers_for_events.borrow().shift_key() {
+                        ImportMode::Move
+                    } else {
+                        ImportMode::Copy
+                    };
                     let import_result = if let Ok(mut store) = store.lock() {
-                        store.add_image_file(path)
+                        store.import_path(path, import_mode)
                     } else {
                         Ok(false)
                     };
 
                     if let Some(ui) = ui_weak.upgrade() {
+                        let action = match import_mode {
+                            ImportMode::Copy => "Copied",
+                            ImportMode::Move => "Moved",
+                        };
                         let status = match import_result {
-                            Ok(true) => format!("Added {}.", path.display()),
-                            Ok(false) => "Image is already buffered.".to_owned(),
+                            Ok(true) => format!("{action} {} into hot storage.", path.display()),
+                            Ok(false) => "File is already buffered.".to_owned(),
                             Err(err) => format!("Import failed: {err:#}"),
                         };
                         ui.set_status_text(status.into());
@@ -180,17 +192,4 @@ fn install_native_window_callbacks(
 
         EventResult::Propagate
     });
-}
-
-fn is_supported_import_path(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff"
-            )
-    )
 }

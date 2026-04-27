@@ -22,7 +22,7 @@ impl SystemTray {
         let menu = Menu::new();
         let show = MenuItem::new("Show Pictray", true, None);
         let toggle = MenuItem::new("Toggle Pictray", true, None);
-        let copy_latest = MenuItem::new("Copy Latest Image", true, None);
+        let copy_latest = MenuItem::new("Copy Latest Item", true, None);
         let clear_history = MenuItem::new("Clear History", true, None);
         let quit = MenuItem::new("Quit", true, None);
 
