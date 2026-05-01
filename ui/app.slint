@@ -7,6 +7,7 @@ export struct ImageTile {
     preview: string,
     line_numbers: string,
     is_text: bool,
+    is_file: bool,
     thumbnail: image,
 }
 
@@ -165,7 +166,97 @@ component Tile inherits Rectangle {
                 }
             }
 
-            if !data.is_text : Image {
+            if data.is_file : Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+                background: selected ? #121923 : #10151d;
+
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 5px;
+                    height: parent.height;
+                    background: selected ? #ead7ad : #b89d6f;
+                }
+
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: 22px;
+                    width: 76px;
+                    height: 90px;
+                    border-radius: 10px;
+                    background: selected ? #f1dfba : #dcc69e;
+                    border-width: 1px;
+                    border-color: #fff7e066;
+
+                    Rectangle {
+                        x: parent.width - 24px;
+                        y: 0px;
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 5px;
+                        background: selected ? #bfa67b : #a99066;
+                    }
+
+                    Text {
+                        x: 8px;
+                        y: 34px;
+                        width: parent.width - 16px;
+                        height: 22px;
+                        text: data.badge;
+                        color: #17181d;
+                        font-size: 12px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                Text {
+                    x: 12px;
+                    y: 124px;
+                    width: parent.width - 24px;
+                    height: 18px;
+                    text: data.title;
+                    color: #faf6ee;
+                    font-size: 13px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                }
+
+                Text {
+                    x: 12px;
+                    y: 144px;
+                    width: parent.width - 24px;
+                    height: 14px;
+                    text: data.subtitle;
+                    color: #aeb7c6;
+                    font-size: 10px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                }
+
+                if selected : Text {
+                    x: 14px;
+                    y: 168px;
+                    width: parent.width - 28px;
+                    height: 32px;
+                    text: data.preview;
+                    color: #dce4f2;
+                    font-size: 10px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                    overflow: elide;
+                }
+            }
+
+            if !data.is_text && !data.is_file : Image {
                 source: data.thumbnail;
                 image-fit: selected ? contain : cover;
                 x: 0px;
@@ -176,7 +267,7 @@ component Tile inherits Rectangle {
             }
         }
 
-        if hover-touch.has-hover && !selected && !data.is_text : Rectangle {
+        if hover-touch.has-hover && !selected && !data.is_text && !data.is_file : Rectangle {
             x: 0px;
             y: 0px;
             width: parent.width;
@@ -312,7 +403,7 @@ export component MainWindow inherits Window {
     background: #00000000;
 
     in property <[ImageTile]> images;
-    in property <string> status-text: "Watching clipboard for images and buffering dropped text files";
+    in property <string> status-text: "Watching clipboard for images and copying dropped file paths";
     in property <bool> drop-active: false;
     in property <bool> show-clear-confirmation: false;
     in property <int> selected-index: -1;
@@ -518,7 +609,7 @@ export component MainWindow inherits Window {
                     alignment: center;
 
                     Text {
-                        text: "Drop image or text files";
+                        text: "Drop any file";
                         color: #fffaf0;
                         font-size: 15px;
                         font-weight: 800;
@@ -526,7 +617,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: "Hold Shift to move";
+                        text: "Copies the path";
                         color: #f5e7c9;
                         font-size: 12px;
                         font-weight: 700;
@@ -568,7 +659,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: "This removes all stored images, GIFs, and text files from the current buffer.";
+                        text: "This removes all stored images, GIFs, text files, and file paths from the current buffer.";
                         color: #c7c2b8;
                         font-size: 12px;
                         horizontal-alignment: center;

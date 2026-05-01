@@ -13,7 +13,7 @@ use crate::{
     MainWindow, clipboard,
     events::AppEvent,
     hotkeys, icon,
-    storage::{ImageStore, ImportMode},
+    storage::ImageStore,
     tray,
     ui::{
         ensure_window_stays_on_top, install_preview_driver, install_ui_callbacks,
@@ -142,7 +142,7 @@ fn install_native_window_callbacks(
                 }
             }
             winit::event::WindowEvent::HoveredFile(path) => {
-                if crate::storage::is_supported_import_path(path) {
+                if path.is_file() {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_drop_active(true);
                     }
@@ -158,27 +158,25 @@ fn install_native_window_callbacks(
                     ui.set_drop_active(false);
                 }
 
-                if crate::storage::is_supported_import_path(path) {
-                    let import_mode = if modifiers_for_events.borrow().shift_key() {
-                        ImportMode::Move
-                    } else {
-                        ImportMode::Copy
-                    };
-                    let import_result = if let Ok(mut store) = store.lock() {
-                        store.import_path(path, import_mode)
+                if path.is_file() {
+                    let copy_result = clipboard::copy_text(&path.to_string_lossy());
+                    let store_result = if let Ok(mut store) = store.lock() {
+                        store.add_file_reference(path)
                     } else {
                         Ok(false)
                     };
-
                     if let Some(ui) = ui_weak.upgrade() {
-                        let action = match import_mode {
-                            ImportMode::Copy => "Copied",
-                            ImportMode::Move => "Moved",
-                        };
-                        let status = match import_result {
-                            Ok(true) => format!("{action} {} into hot storage.", path.display()),
-                            Ok(false) => "File is already buffered.".to_owned(),
-                            Err(err) => format!("Import failed: {err:#}"),
+                        let status = match (copy_result, store_result) {
+                            (Ok(()), Ok(true)) => {
+                                format!("Buffered file path and copied it: {}", path.display())
+                            }
+                            (Ok(()), Ok(false)) => {
+                                format!("Copied existing file path: {}", path.display())
+                            }
+                            (Ok(()), Err(err)) => format!(
+                                "Copied path, but buffering failed: {err:#}"
+                            ),
+                            (Err(err), _) => format!("Copy failed: {err:#}"),
                         };
                         ui.set_status_text(status.into());
                     }

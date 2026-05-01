@@ -16,6 +16,12 @@ pub struct ClipboardWorker {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+pub fn copy_text(text: &str) -> anyhow::Result<()> {
+    let mut clipboard = Clipboard::new()?;
+    clipboard.set_text(text.to_owned())?;
+    Ok(())
+}
+
 impl Drop for ClipboardWorker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);

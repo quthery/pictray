@@ -15,6 +15,7 @@ pub enum StoredImageKind {
     Raster,
     Gif,
     Text,
+    File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub struct StoredImage {
     pub kind: StoredImageKind,
     pub original_path: PathBuf,
     pub thumbnail_path: Option<PathBuf>,
+    pub reference_path: Option<PathBuf>,
     pub text_preview: String,
     pub line_count: usize,
     pub byte_len: u64,
@@ -41,8 +43,8 @@ pub struct StoredImage {
 impl StoredImage {
     pub fn preview_rgba(&self) -> anyhow::Result<(u32, u32, Vec<u8>)> {
         anyhow::ensure!(
-            self.kind != StoredImageKind::Text,
-            "text files do not expose image previews",
+            matches!(self.kind, StoredImageKind::Raster | StoredImageKind::Gif),
+            "this item does not expose image previews",
         );
 
         let rgba = image::open(&self.original_path)
@@ -59,6 +61,7 @@ pub struct ImageStore {
     originals_dir: PathBuf,
     thumbnails_dir: PathBuf,
     metadata_dir: PathBuf,
+    file_refs_dir: PathBuf,
     records: Vec<StoredImage>,
 }
 
@@ -74,18 +77,26 @@ impl ImageStore {
         let originals_dir = root.join("originals");
         let thumbnails_dir = root.join("thumbnails");
         let metadata_dir = root.join("metadata");
+        let file_refs_dir = root.join("file-refs");
 
         fs::create_dir_all(&originals_dir)?;
         fs::create_dir_all(&thumbnails_dir)?;
         fs::create_dir_all(&metadata_dir)?;
+        fs::create_dir_all(&file_refs_dir)?;
 
-        let records = load_records(&originals_dir, &thumbnails_dir, &metadata_dir)?;
+        let records = load_records(
+            &originals_dir,
+            &thumbnails_dir,
+            &metadata_dir,
+            &file_refs_dir,
+        )?;
 
         Ok(Self {
             root,
             originals_dir,
             thumbnails_dir,
             metadata_dir,
+            file_refs_dir,
             records,
         })
     }
@@ -121,6 +132,54 @@ impl ImageStore {
         } else {
             anyhow::bail!("{} is not a supported image or text file", path.display());
         }
+    }
+
+    pub fn add_file_reference(&mut self, path: &Path) -> anyhow::Result<bool> {
+        anyhow::ensure!(path.is_file(), "{} is not a regular file", path.display());
+
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path_text = path.to_string_lossy().into_owned();
+        let hash = format!("file-{}", blake3::hash(path_text.as_bytes()).to_hex());
+
+        if self.promote_existing(&hash) {
+            return Ok(true);
+        }
+
+        let display_name = normalize_display_name(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("File"),
+        );
+        let reference_path = self.file_refs_dir.join(format!("{hash}.path"));
+        let metadata_path = self.metadata_dir.join(format!("{hash}.txt"));
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+        let file_extension = normalized_file_extension_from_name(&display_name);
+
+        fs::write(&reference_path, path_text.as_bytes())
+            .with_context(|| format!("failed to save {}", reference_path.display()))?;
+        fs::write(&metadata_path, &display_name)
+            .with_context(|| format!("failed to save {}", metadata_path.display()))?;
+
+        self.records.insert(
+            0,
+            StoredImage {
+                hash,
+                display_name,
+                width: 0,
+                height: 0,
+                kind: StoredImageKind::File,
+                original_path: path,
+                thumbnail_path: None,
+                reference_path: Some(reference_path),
+                text_preview: String::new(),
+                line_count: 0,
+                byte_len: metadata.len(),
+                file_extension,
+            },
+        );
+
+        Ok(true)
     }
 
     fn add_image_file_with_mode(&mut self, path: &Path, mode: ImportMode) -> anyhow::Result<bool> {
@@ -198,6 +257,7 @@ impl ImageStore {
                 kind: StoredImageKind::Text,
                 original_path,
                 thumbnail_path: None,
+                reference_path: None,
                 text_preview: build_text_preview(text),
                 line_count: text.lines().count(),
                 byte_len: encoded.len() as u64,
@@ -247,6 +307,7 @@ impl ImageStore {
                 kind: StoredImageKind::Gif,
                 original_path,
                 thumbnail_path: Some(thumbnail_path),
+                reference_path: None,
                 text_preview: String::new(),
                 line_count: 0,
                 byte_len: encoded.len() as u64,
@@ -295,6 +356,7 @@ impl ImageStore {
                 kind: StoredImageKind::Raster,
                 original_path,
                 thumbnail_path: Some(thumbnail_path),
+                reference_path: None,
                 text_preview: String::new(),
                 line_count: 0,
                 byte_len: rgba_image.as_raw().len() as u64,
@@ -318,6 +380,9 @@ impl ImageStore {
                     format!("failed to open {}", record.original_path.display())
                 })?;
                 clipboard.set_text(text)?;
+            }
+            StoredImageKind::File => {
+                clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
             }
             StoredImageKind::Gif | StoredImageKind::Raster => {
                 let rgba = image::open(&record.original_path)
@@ -357,9 +422,14 @@ impl ImageStore {
         }
 
         let record = self.records.remove(index);
-        remove_file_if_exists(record.original_path)?;
+        if record.kind != StoredImageKind::File {
+            remove_file_if_exists(record.original_path)?;
+        }
         if let Some(thumbnail_path) = record.thumbnail_path {
             remove_file_if_exists(thumbnail_path)?;
+        }
+        if let Some(reference_path) = record.reference_path {
+            remove_file_if_exists(reference_path)?;
         }
         remove_file_if_exists(self.metadata_dir.join(format!("{}.txt", record.hash)))?;
         Ok(())
@@ -367,9 +437,14 @@ impl ImageStore {
 
     pub fn clear(&mut self) -> anyhow::Result<()> {
         for record in self.records.drain(..) {
-            remove_file_if_exists(record.original_path)?;
+            if record.kind != StoredImageKind::File {
+                remove_file_if_exists(record.original_path)?;
+            }
             if let Some(thumbnail_path) = record.thumbnail_path {
                 remove_file_if_exists(thumbnail_path)?;
+            }
+            if let Some(reference_path) = record.reference_path {
+                remove_file_if_exists(reference_path)?;
             }
             remove_file_if_exists(self.metadata_dir.join(format!("{}.txt", record.hash)))?;
         }
@@ -472,6 +547,7 @@ fn load_records(
     originals_dir: &Path,
     thumbnails_dir: &Path,
     metadata_dir: &Path,
+    file_refs_dir: &Path,
 ) -> anyhow::Result<Vec<StoredImage>> {
     let mut records = Vec::new();
 
@@ -489,6 +565,23 @@ fn load_records(
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(err) => eprintln!("skipping stored image {}: {err:#}", path.display()),
+        }
+    }
+
+    for entry in fs::read_dir(file_refs_dir)
+        .with_context(|| format!("failed to read {}", file_refs_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        match load_file_record(&path, metadata_dir) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(err) => eprintln!("skipping file reference {}: {err:#}", path.display()),
         }
     }
 
@@ -548,6 +641,7 @@ fn load_record(
             kind,
             original_path: original_path.to_path_buf(),
             thumbnail_path: Some(thumbnail_path),
+            reference_path: None,
             text_preview: String::new(),
             line_count: 0,
             byte_len: fs::metadata(original_path)
@@ -591,6 +685,7 @@ fn load_text_record(
             kind: StoredImageKind::Text,
             original_path: original_path.to_path_buf(),
             thumbnail_path: None,
+            reference_path: None,
             text_preview: build_text_preview(text),
             line_count: text.lines().count(),
             byte_len: encoded.len() as u64,
@@ -599,8 +694,39 @@ fn load_text_record(
     )))
 }
 
-pub fn is_supported_import_path(path: &Path) -> bool {
-    is_supported_image_file(path) || looks_like_supported_text_path(path)
+fn load_file_record(
+    reference_path: &Path,
+    metadata_dir: &Path,
+) -> anyhow::Result<Option<(SystemTime, StoredImage)>> {
+    let Some(hash) = reference_path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    let path_text = fs::read_to_string(reference_path)
+        .with_context(|| format!("failed to read {}", reference_path.display()))?;
+    let original_path = PathBuf::from(path_text);
+    let metadata = fs::metadata(&original_path)
+        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?;
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let display_name = load_display_name(metadata_dir.join(format!("{hash}.txt")), hash);
+    let file_extension = normalized_file_extension(&original_path, &display_name);
+
+    Ok(Some((
+        modified,
+        StoredImage {
+            hash: hash.to_owned(),
+            display_name,
+            width: 0,
+            height: 0,
+            kind: StoredImageKind::File,
+            original_path,
+            thumbnail_path: None,
+            reference_path: Some(reference_path.to_path_buf()),
+            text_preview: String::new(),
+            line_count: 0,
+            byte_len: metadata.len(),
+            file_extension,
+        },
+    )))
 }
 
 fn is_supported_image_file(path: &Path) -> bool {
@@ -735,6 +861,23 @@ fn normalized_text_extension(path: &Path) -> String {
         .map(|ext| ext.to_ascii_lowercase())
         .filter(|ext| !ext.is_empty())
         .unwrap_or_else(|| "text".to_owned())
+}
+
+fn normalized_file_extension(path: &Path, display_name: &str) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| normalized_file_extension_from_name(display_name))
+}
+
+fn normalized_file_extension_from_name(display_name: &str) -> String {
+    Path::new(display_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "file".to_owned())
 }
 
 fn persisted_text_extension(path: &Path) -> String {
@@ -963,6 +1106,44 @@ mod tests {
             assert_eq!(reopened.records[0].kind, StoredImageKind::Text);
             assert_eq!(reopened.records[0].file_extension, "rs");
             assert!(reopened.records[0].text_preview.contains("println!"));
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn generic_file_reference_is_preserved_without_copying_source() {
+        let root = temp_store_root();
+        let result = (|| -> anyhow::Result<()> {
+            let input_file = root.join("archive.bin");
+            fs::create_dir_all(&root)?;
+            fs::write(&input_file, [0, 159, 146, 150, 255])?;
+
+            let mut store = ImageStore::open_at(root.join("store"))?;
+            assert!(store.add_file_reference(&input_file)?);
+            assert_eq!(store.records.len(), 1);
+            assert_eq!(store.records[0].kind, StoredImageKind::File);
+            assert_eq!(store.records[0].file_extension, "bin");
+            assert_eq!(store.records[0].byte_len, 5);
+            assert!(input_file.exists());
+
+            let reference_path = store.records[0]
+                .reference_path
+                .clone()
+                .expect("file references store a pointer file");
+            assert!(reference_path.exists());
+
+            let mut reopened = ImageStore::open_at(root.join("store"))?;
+            assert_eq!(reopened.records.len(), 1);
+            assert_eq!(reopened.records[0].kind, StoredImageKind::File);
+            assert_eq!(reopened.records[0].display_name, "archive.bin");
+
+            reopened.delete(0)?;
+            assert!(input_file.exists());
+            assert!(!reference_path.exists());
 
             Ok(())
         })();

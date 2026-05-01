@@ -47,6 +47,7 @@ struct CachedTile {
     preview: SharedString,
     line_numbers: SharedString,
     is_text: bool,
+    is_file: bool,
     image: CachedTileImage,
 }
 
@@ -100,6 +101,7 @@ impl PreviewState {
                 preview: tile.preview.clone(),
                 line_numbers: tile.line_numbers.clone(),
                 is_text: tile.is_text,
+                is_file: tile.is_file,
                 thumbnail: tile.current_image(),
             })
             .collect()
@@ -364,26 +366,32 @@ fn load_tile_preview(record: &StoredImage) -> CachedTile {
         StoredImageKind::Gif => "GIF".into(),
         StoredImageKind::Raster => record.file_extension.to_ascii_uppercase().into(),
         StoredImageKind::Text => text_file_badge(record).into(),
+        StoredImageKind::File => file_badge(record).into(),
     };
     let subtitle = match record.kind {
         StoredImageKind::Gif => format!("{}x{} GIF", record.width, record.height).into(),
         StoredImageKind::Raster => format!("{}x{}", record.width, record.height).into(),
         StoredImageKind::Text => text_file_subtitle(record).into(),
+        StoredImageKind::File => file_subtitle(record).into(),
     };
-    let preview: SharedString = record.text_preview.clone().into();
+    let preview: SharedString = match record.kind {
+        StoredImageKind::File => compact_path_preview(&record.original_path).into(),
+        _ => record.text_preview.clone().into(),
+    };
     let line_numbers: SharedString = if record.kind == StoredImageKind::Text {
         preview_line_numbers(&record.text_preview).into()
     } else {
         SharedString::default()
     };
     let is_text = record.kind == StoredImageKind::Text;
+    let is_file = record.kind == StoredImageKind::File;
 
     let image = match record.kind {
         StoredImageKind::Gif => load_animated_preview(record)
             .map(CachedTileImage::Animated)
             .unwrap_or_else(|| CachedTileImage::Static(load_static_preview_image(record))),
         StoredImageKind::Raster => CachedTileImage::Static(load_static_preview_image(record)),
-        StoredImageKind::Text => CachedTileImage::Static(Image::default()),
+        StoredImageKind::Text | StoredImageKind::File => CachedTileImage::Static(Image::default()),
     };
 
     CachedTile {
@@ -393,6 +401,7 @@ fn load_tile_preview(record: &StoredImage) -> CachedTile {
         preview,
         line_numbers,
         is_text,
+        is_file,
         image,
     }
 }
@@ -422,6 +431,34 @@ fn text_file_subtitle(record: &StoredImage) -> String {
         record.line_count,
         format_byte_len(record.byte_len),
     )
+}
+
+fn file_badge(record: &StoredImage) -> String {
+    let normalized = if record.file_extension == "file" {
+        "file"
+    } else {
+        record.file_extension.as_str()
+    };
+    normalized
+        .chars()
+        .take(5)
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn file_subtitle(record: &StoredImage) -> String {
+    format!(
+        "{} file • {}",
+        file_badge(record),
+        format_byte_len(record.byte_len)
+    )
+}
+
+fn compact_path_preview(path: &std::path::Path) -> String {
+    path.parent()
+        .map(|parent| parent.display().to_string())
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn preview_line_numbers(preview: &str) -> String {
