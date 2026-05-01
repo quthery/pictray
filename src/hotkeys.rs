@@ -16,7 +16,7 @@ pub struct Hotkeys {
 impl Hotkeys {
     pub fn register(event_tx: crossbeam_channel::Sender<AppEvent>) -> anyhow::Result<Self> {
         let manager = GlobalHotKeyManager::new()?;
-        let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
+        let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC);
         manager.register(hotkey)?;
 
         thread::spawn(move || {

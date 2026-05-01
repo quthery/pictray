@@ -408,6 +408,14 @@ impl ImageStore {
         Ok(true)
     }
 
+    pub fn drag_path(&self, index: usize) -> anyhow::Result<PathBuf> {
+        let record = self
+            .records
+            .get(index)
+            .ok_or_else(|| anyhow!("item index {index} does not exist"))?;
+        Ok(record.original_path.clone())
+    }
+
     pub fn reveal_in_file_manager(&self, index: usize) -> anyhow::Result<()> {
         let record = self
             .records

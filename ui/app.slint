@@ -17,8 +17,10 @@ component Tile inherits Rectangle {
     in property <bool> selected: false;
     callback inspect-requested(int);
     callback copy-requested(int);
+    callback drag-out-requested(int);
     callback delete-requested(int);
     callback select-requested(int);
+    property <bool> drag-copy-fired: false;
 
     border-radius: 18px;
     background: #0b0d11;
@@ -33,7 +35,24 @@ component Tile inherits Rectangle {
     hover-touch := TouchArea {
         mouse-cursor: MouseCursor.default;
         clicked => {
-            root.select-requested(root.index);
+            if !root.drag-copy-fired {
+                root.select-requested(root.index);
+            }
+        }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                root.drag-copy-fired = false;
+            }
+        }
+        moved => {
+            if self.pressed && !root.drag-copy-fired
+                    && (self.mouse-x - self.pressed-x > 18px
+                        || self.pressed-x - self.mouse-x > 18px
+                        || self.mouse-y - self.pressed-y > 18px
+                        || self.pressed-y - self.mouse-y > 18px) {
+                root.drag-copy-fired = true;
+                root.drag-out-requested(root.index);
+            }
         }
 
         Rectangle {
@@ -409,6 +428,7 @@ export component MainWindow inherits Window {
     in property <int> selected-index: -1;
     callback inspect-image(int);
     callback copy-image(int);
+    callback drag-out-image(int);
     callback delete-image(int);
     callback select-image(int);
     callback begin-window-drag();
@@ -567,6 +587,9 @@ export component MainWindow inherits Window {
                         }
                         copy-requested(index) => {
                             root.copy-image(index);
+                        }
+                        drag-out-requested(index) => {
+                            root.drag-out-image(index);
                         }
                         delete-requested(index) => {
                             root.delete-image(index);

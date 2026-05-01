@@ -19,5 +19,8 @@ tray-icon = "0.22.1"
 objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSApplication", "NSResponder", "NSRunningApplication"] }
 objc2-foundation = { version = "0.2.2", default-features = false, features = ["NSThread"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+drag = "2.1.0"
+
 [build-dependencies]
 slint-build = "1.16.1"

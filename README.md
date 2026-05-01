@@ -13,7 +13,7 @@ It starts hidden, watches the clipboard for images, stores them locally, and let
 - Deduplicates images and moves repeated items back to the front
 - Copies the original filesystem path when you drop a file into the window
 - Shows recent images, text files, and file paths in a small preview gallery
-- Copies the latest stored item with `Ctrl+Shift+V`
+- Copies the latest stored item back to the clipboard with `Ctrl+Shift+C`
 - Lets you paste from the open window with `Ctrl+V` or `Cmd+V`
 
 ## Run
@@ -36,7 +36,7 @@ cargo fmt --check
 2. Copy an image in another app.
 3. Click the tray icon to open the window.
 4. Drag any file into the window to buffer its path and copy the full path to the clipboard.
-5. Copy a stored image, text file, or file path back to the clipboard from the UI, tray menu, or `Ctrl+Shift+V`.
+5. Copy a stored image, text file, or file path back to the clipboard from the UI, tray menu, or `Ctrl+Shift+C`.
 
 ## Storage
 

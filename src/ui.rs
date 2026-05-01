@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     fs::File,
     io::BufReader,
+    path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -32,6 +33,31 @@ pub fn ensure_window_stays_on_top(ui: &MainWindow) {
             // Re-assert the native window level when the tray shows the panel again.
             window.set_window_level(winit::window::WindowLevel::AlwaysOnTop);
         });
+}
+
+#[cfg(target_os = "windows")]
+fn start_native_file_drag(ui: &MainWindow, path: PathBuf) -> anyhow::Result<bool> {
+    let path = path.canonicalize().unwrap_or(path);
+    ui.window()
+        .with_winit_window(|window: &winit::window::Window| {
+            let item = drag::DragItem::Files(vec![path.clone()]);
+            let preview = drag::Image::File(path);
+            drag::start_drag(
+                window,
+                item,
+                preview,
+                |_result, _cursor_position| {},
+                Default::default(),
+            )
+            .map(|_| true)
+            .map_err(anyhow::Error::from)
+        })
+        .unwrap_or(Ok(false))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_native_file_drag(_ui: &MainWindow, _path: PathBuf) -> anyhow::Result<bool> {
+    Ok(false)
 }
 
 #[derive(Default)]
@@ -159,6 +185,39 @@ pub fn install_ui_callbacks(
         }
 
         let _ = copy_tx.send(AppEvent::StorageChanged);
+    });
+
+    let drag_out_store = Arc::clone(&store);
+    let drag_out_ui_weak = ui.as_weak();
+    ui.on_drag_out_image(move |index| {
+        let drag_path = match drag_out_store.lock() {
+            Ok(store) => store.drag_path(index as usize),
+            Err(_) => Err(anyhow::anyhow!("storage lock is poisoned")),
+        };
+
+        let status = match drag_path {
+            Ok(path) => {
+                let native_drag = if let Some(ui) = drag_out_ui_weak.upgrade() {
+                    start_native_file_drag(&ui, path.clone())
+                } else {
+                    Ok(false)
+                };
+
+                match native_drag {
+                    Ok(true) => "Started file drag.".to_owned(),
+                    Ok(false) => match crate::clipboard::copy_text(&path.to_string_lossy()) {
+                        Ok(()) => format!("Copied path to clipboard: {}", path.display()),
+                        Err(err) => format!("Drag failed: {err:#}"),
+                    },
+                    Err(err) => format!("Drag failed: {err:#}"),
+                }
+            }
+            Err(err) => format!("Drag failed: {err:#}"),
+        };
+
+        if let Some(ui) = drag_out_ui_weak.upgrade() {
+            ui.set_status_text(status.into());
+        }
     });
 
     let inspect_store = Arc::clone(&store);
