@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: pictray
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+            binary_path: target/release/pictray
+            archive_name: pictray-linux-x86_64.tar.gz
+          - os: macos-latest
+            label: macOS arm64
+            binary_path: target/release/pictray
+            archive_name: pictray-macos-arm64.tar.gz
+          - os: macos-15-intel
+            label: macOS x86_64
+            binary_path: target/release/pictray
+            archive_name: pictray-macos-x86_64.tar.gz
+          - os: windows-latest
+            label: Windows
+            binary_path: target/release/pictray.exe
+            archive_name: pictray-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcursor-dev \
+            libxkbcommon-x11-dev \
+            xinput
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Unix build
+        if: runner.os != 'Windows'
+        run: |
+          rm -rf package
+          mkdir -p package/${{ env.BIN_NAME }}
+          cp README.md LICENSE package/${{ env.BIN_NAME }}/
+          cp "${{ matrix.binary_path }}" package/${{ env.BIN_NAME }}/${{ env.BIN_NAME }}
+          tar -C package -czf "${{ matrix.archive_name }}" "${{ env.BIN_NAME }}"
+
+      - name: Package Windows build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path package) { Remove-Item package -Recurse -Force }
+          New-Item -ItemType Directory -Path "package/${env:BIN_NAME}" | Out-Null
+          Copy-Item README.md, LICENSE -Destination "package/${env:BIN_NAME}"
+          Copy-Item "${{ matrix.binary_path }}" -Destination "package/${env:BIN_NAME}/${env:BIN_NAME}.exe"
+          Compress-Archive -Path "package/${env:BIN_NAME}" -DestinationPath "${{ matrix.archive_name }}" -Force
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --generate-notes || true
+          fi
+
+          gh release upload "$tag" "${{ matrix.archive_name }}" --clobber
