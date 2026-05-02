@@ -15,10 +15,6 @@ image = { version = "0.25.10", default-features = false, features = ["bmp", "gif
 slint = { version = "1.16.1", features = ["unstable-winit-030"] }
 tray-icon = "0.22.1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.2.2", default-features = false, features = ["NSApplication", "NSResponder", "NSRunningApplication"] }
-objc2-foundation = { version = "0.2.2", default-features = false, features = ["NSThread"] }
-
 [target.'cfg(target_os = "windows")'.dependencies]
 drag = "2.1.0"
 

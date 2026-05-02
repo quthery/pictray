@@ -6,7 +6,11 @@ use std::{
 
 use anyhow::Context;
 use crossbeam_channel::unbounded;
+#[cfg(target_os = "macos")]
+use slint::winit_030::winit::platform::macos::EventLoopBuilderExtMacOS;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
+#[cfg(target_os = "macos")]
+use slint::winit_030::{SlintEvent, winit::platform::macos::ActivationPolicy};
 use slint::{CloseRequestResponse, ComponentHandle};
 
 use crate::{
@@ -22,12 +26,7 @@ use crate::{
 };
 
 pub fn run() -> anyhow::Result<()> {
-    slint::BackendSelector::new()
-        .backend_name("winit".into())
-        .select()
-        .context("failed to select winit backend")?;
-
-    configure_platform_app_mode()?;
+    select_backend()?;
 
     let (event_tx, event_rx) = unbounded::<AppEvent>();
     let store = Arc::new(Mutex::new(ImageStore::open()?));
@@ -55,23 +54,29 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn configure_platform_app_mode() -> anyhow::Result<()> {
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-    use objc2_foundation::MainThreadMarker;
+fn select_backend() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut event_loop_builder = winit::event_loop::EventLoop::<SlintEvent>::with_user_event();
+        // Winit treats unbundled macOS executables as regular apps by default, so
+        // force the accessory policy to keep `cargo run` tray-only as well.
+        event_loop_builder.with_activation_policy(ActivationPolicy::Accessory);
 
-    let mtm =
-        MainThreadMarker::new().context("macOS app mode must be configured on the main thread")?;
-    let app = NSApplication::sharedApplication(mtm);
-    anyhow::ensure!(
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory),
-        "failed to switch Pictray to tray-only mode",
-    );
-    Ok(())
-}
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .with_winit_event_loop_builder(event_loop_builder)
+            .select()
+            .context("failed to select winit backend")?;
+    }
 
-#[cfg(not(target_os = "macos"))]
-fn configure_platform_app_mode() -> anyhow::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .select()
+            .context("failed to select winit backend")?;
+    }
+
     Ok(())
 }
 
