@@ -265,14 +265,34 @@ pub fn install_ui_callbacks(
     let delete_tx = event_tx.clone();
     let delete_ui_weak = ui.as_weak();
     ui.on_delete_image(move |index| {
-        if let Ok(mut store) = delete_store.lock() {
-            let _ = store.delete(index as usize);
-        }
+        let (status, changed) = match delete_store.lock() {
+            Ok(mut store) => {
+                let had_record = (index as usize) < store.records().len();
+                if !had_record {
+                    ("No buffered item is available to remove.".to_owned(), false)
+                } else {
+                    match store.delete(index as usize) {
+                        Ok(()) => ("Removed item from the buffer.".to_owned(), true),
+                        Err(err) => (
+                            format!("Removed item from this session, but cleanup failed: {err:#}"),
+                            true,
+                        ),
+                    }
+                }
+            }
+            Err(_) => ("Remove failed: storage lock is poisoned.".to_owned(), false),
+        };
+
         if let Some(ui) = delete_ui_weak.upgrade() {
-            ui.set_selected_index(-1);
-            ui.set_status_text("Removed item from the buffer.".into());
+            if changed {
+                ui.set_selected_index(-1);
+            }
+            ui.set_status_text(status.into());
+            ui.set_show_clear_confirmation(false);
         }
-        let _ = delete_tx.send(AppEvent::StorageChanged);
+        if changed {
+            let _ = delete_tx.send(AppEvent::StorageChanged);
+        }
     });
 
     let select_ui_weak = ui.as_weak();
@@ -289,14 +309,52 @@ pub fn install_ui_callbacks(
 
     let clear_ui_weak = ui.as_weak();
     ui.on_clear_all(move || {
-        if let Ok(mut store) = store.lock() {
-            let _ = store.clear();
-        }
         if let Some(ui) = clear_ui_weak.upgrade() {
-            ui.set_selected_index(-1);
-            ui.set_status_text("Buffer cleared.".into());
+            ui.set_show_clear_confirmation(true);
         }
-        let _ = event_tx.send(AppEvent::StorageChanged);
+    });
+
+    let confirm_clear_store = Arc::clone(&store);
+    let confirm_clear_tx = event_tx.clone();
+    let confirm_clear_ui_weak = ui.as_weak();
+    ui.on_confirm_clear_all(move || {
+        let (status, changed) = match confirm_clear_store.lock() {
+            Ok(mut store) => {
+                let had_records = !store.records().is_empty();
+                if !had_records {
+                    ("Buffer is already empty.".to_owned(), false)
+                } else {
+                    match store.clear() {
+                        Ok(()) => ("Buffer cleared.".to_owned(), true),
+                        Err(err) => (
+                            format!(
+                                "Buffer cleared from this session, but cleanup failed: {err:#}"
+                            ),
+                            true,
+                        ),
+                    }
+                }
+            }
+            Err(_) => ("Clear failed: storage lock is poisoned.".to_owned(), false),
+        };
+
+        if let Some(ui) = confirm_clear_ui_weak.upgrade() {
+            ui.set_show_clear_confirmation(false);
+            if changed {
+                ui.set_selected_index(-1);
+            }
+            ui.set_status_text(status.into());
+        }
+        if changed {
+            let _ = confirm_clear_tx.send(AppEvent::StorageChanged);
+        }
+    });
+
+    let cancel_clear_ui_weak = ui.as_weak();
+    ui.on_cancel_clear_all(move || {
+        if let Some(ui) = cancel_clear_ui_weak.upgrade() {
+            ui.set_show_clear_confirmation(false);
+        }
     });
 }
 
@@ -385,16 +443,22 @@ pub fn start_event_bridge(
                     });
                 }
                 AppEvent::RequestClearHistory => {
-                    if let Ok(mut store) = store.lock() {
-                        let _ = store.clear();
-                    }
                     let ui_weak = ui_weak.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_selected_index(-1);
-                            ui.set_status_text("Buffer cleared.".into());
-                        }
-                    });
+                    let _ =
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                if !ui.window().is_visible() {
+                                    let _ = ui.show();
+                                }
+                                ensure_window_stays_on_top(&ui);
+                                apply_native_background_effects(&ui);
+                                ui.set_show_clear_confirmation(true);
+                                let _ = ui.window().with_winit_window(
+                                    |window: &winit::window::Window| window.focus_window(),
+                                );
+                                ui.window().request_redraw();
+                            }
+                        });
                 }
                 AppEvent::StorageChanged => {}
                 AppEvent::Quit => {
@@ -604,6 +668,12 @@ fn normalized_gif_delay(delay: image::Delay) -> Duration {
 }
 
 fn load_static_preview_image(record: &StoredImage) -> Image {
+    if let Some(thumbnail_path) = record.thumbnail_path.as_ref().filter(|path| path.is_file()) {
+        if let Ok(rgba) = image::open(thumbnail_path).map(|image| image.to_rgba8()) {
+            return image_from_rgba((rgba.width(), rgba.height(), rgba.into_raw()));
+        }
+    }
+
     record
         .preview_rgba()
         .map(image_from_rgba)

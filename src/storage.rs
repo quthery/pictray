@@ -393,6 +393,11 @@ impl ImageStore {
             .ok_or_else(|| anyhow!("image index {index} does not exist"))?;
         let mut clipboard = Clipboard::new()?;
 
+        if record.reference_path.is_some() {
+            clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
+            return Ok(());
+        }
+
         match record.kind {
             StoredImageKind::Text => {
                 let text = fs::read_to_string(&record.original_path).with_context(|| {
@@ -401,27 +406,17 @@ impl ImageStore {
                 clipboard.set_text(text)?;
             }
             StoredImageKind::File => {
-                if record.reference_path.is_some() {
-                    clipboard.set().file_list(&[record.original_path.clone()])?;
-                } else {
-                    clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
-                }
+                clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
             }
             StoredImageKind::Gif | StoredImageKind::Raster => {
-                if record.reference_path.is_some() {
-                    clipboard.set().file_list(&[record.original_path.clone()])?;
-                } else {
-                    let rgba = image::open(&record.original_path)
-                        .with_context(|| {
-                            format!("failed to open {}", record.original_path.display())
-                        })?
-                        .to_rgba8();
-                    clipboard.set_image(ImageData {
-                        width: rgba.width() as usize,
-                        height: rgba.height() as usize,
-                        bytes: Cow::Owned(rgba.into_raw()),
-                    })?;
-                }
+                let rgba = image::open(&record.original_path)
+                    .with_context(|| format!("failed to open {}", record.original_path.display()))?
+                    .to_rgba8();
+                clipboard.set_image(ImageData {
+                    width: rgba.width() as usize,
+                    height: rgba.height() as usize,
+                    bytes: Cow::Owned(rgba.into_raw()),
+                })?;
             }
         }
 
