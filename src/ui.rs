@@ -35,6 +35,34 @@ pub fn ensure_window_stays_on_top(ui: &MainWindow) {
         });
 }
 
+pub fn apply_native_background_effects(ui: &MainWindow) {
+    let _ = ui
+        .window()
+        .with_winit_window(apply_native_background_effects_to_window);
+}
+
+fn apply_native_background_effects_to_window(window: &winit::window::Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use slint::winit_030::winit::platform::windows::{BackdropType, WindowExtWindows};
+
+        window.set_system_backdrop(BackdropType::TransientWindow);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        window.set_transparent(true);
+        window.set_blur(true);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // On Wayland this uses the compositor blur protocol when available.
+        // On X11 it gracefully no-ops.
+        window.set_blur(true);
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn start_native_file_drag(ui: &MainWindow, path: PathBuf) -> anyhow::Result<bool> {
     let path = path.canonicalize().unwrap_or(path);
@@ -170,7 +198,6 @@ pub fn install_ui_callbacks(
 
     let copy_store = Arc::clone(&store);
     let copy_ui_weak = ui.as_weak();
-    let copy_tx = event_tx.clone();
     ui.on_copy_image(move |index| {
         let status = match copy_store.lock() {
             Ok(store) => match store.copy_to_clipboard(index as usize) {
@@ -183,8 +210,6 @@ pub fn install_ui_callbacks(
         if let Some(ui) = copy_ui_weak.upgrade() {
             ui.set_status_text(status.into());
         }
-
-        let _ = copy_tx.send(AppEvent::StorageChanged);
     });
 
     let drag_out_store = Arc::clone(&store);
@@ -245,6 +270,7 @@ pub fn install_ui_callbacks(
         }
         if let Some(ui) = delete_ui_weak.upgrade() {
             ui.set_selected_index(-1);
+            ui.set_status_text("Removed item from the buffer.".into());
         }
         let _ = delete_tx.send(AppEvent::StorageChanged);
     });
@@ -261,9 +287,14 @@ pub fn install_ui_callbacks(
         }
     });
 
+    let clear_ui_weak = ui.as_weak();
     ui.on_clear_all(move || {
         if let Ok(mut store) = store.lock() {
             let _ = store.clear();
+        }
+        if let Some(ui) = clear_ui_weak.upgrade() {
+            ui.set_selected_index(-1);
+            ui.set_status_text("Buffer cleared.".into());
         }
         let _ = event_tx.send(AppEvent::StorageChanged);
     });
@@ -304,6 +335,7 @@ pub fn start_event_bridge(
                                     let _ = ui.show();
                                 }
                                 ensure_window_stays_on_top(&ui);
+                                apply_native_background_effects(&ui);
                                 if let Some(anchor) = anchor {
                                     place_window_near_anchor(&ui, anchor);
                                 }
@@ -323,6 +355,7 @@ pub fn start_event_bridge(
                             } else {
                                 let _ = ui.show();
                                 ensure_window_stays_on_top(&ui);
+                                apply_native_background_effects(&ui);
                                 if let Some(anchor) = anchor {
                                     place_window_near_anchor(&ui, anchor);
                                 }
@@ -358,24 +391,12 @@ pub fn start_event_bridge(
                     let ui_weak = ui_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_status_text("0 item(s) in hot storage.".into());
+                            ui.set_selected_index(-1);
+                            ui.set_status_text("Buffer cleared.".into());
                         }
                     });
                 }
-                AppEvent::StorageChanged => {
-                    let count = match store.lock() {
-                        Ok(store) => store.records().len(),
-                        Err(_) => 0,
-                    };
-                    let status = format!("{count} item(s) in hot storage.");
-
-                    let ui_weak = ui_weak.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_status_text(status.into());
-                        }
-                    });
-                }
+                AppEvent::StorageChanged => {}
                 AppEvent::Quit => {
                     let _ = slint::invoke_from_event_loop(|| {
                         let _ = slint::quit_event_loop();
