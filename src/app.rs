@@ -45,7 +45,6 @@ pub fn run() -> anyhow::Result<()> {
 
     let _tray = tray::SystemTray::new(event_tx.clone())?;
     let _hotkeys = hotkeys::Hotkeys::register(event_tx.clone())?;
-    let _clipboard_worker = clipboard::spawn_watcher(Arc::clone(&store), event_tx.clone());
 
     let _ = event_tx.send(AppEvent::StorageChanged);
 
@@ -120,29 +119,65 @@ fn install_native_window_callbacks(
             winit::event::WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
                 if event.state.is_pressed() =>
             {
-                let is_paste = matches!(event.logical_key.as_ref(), winit::keyboard::Key::Character(ch) if ch.eq_ignore_ascii_case("v"))
-                    && {
-                        let modifiers = *modifiers_for_events.borrow();
-                        modifiers.super_key() || modifiers.control_key()
-                    };
+                let modifiers = *modifiers_for_events.borrow();
+                let has_shortcut_modifier = modifiers.super_key() || modifiers.control_key();
+                let is_paste = has_shortcut_modifier
+                    && matches!(event.logical_key.as_ref(), winit::keyboard::Key::Character(ch) if ch.eq_ignore_ascii_case("v"));
+                let is_copy = has_shortcut_modifier
+                    && matches!(event.logical_key.as_ref(), winit::keyboard::Key::Character(ch) if ch.eq_ignore_ascii_case("c"));
 
                 if is_paste {
                     let paste_result = if let Ok(mut store) = store.lock() {
-                        store.add_current_clipboard_image()
+                        store.add_current_clipboard_item()
                     } else {
                         Ok(false)
                     };
+                    let pasted = matches!(&paste_result, Ok(true));
 
                     if let Some(ui) = ui_weak.upgrade() {
-                        let status = match paste_result {
-                            Ok(true) => "Added image from clipboard.".to_owned(),
-                            Ok(false) => "Clipboard image already buffered or unavailable.".to_owned(),
+                        let status = match &paste_result {
+                            Ok(true) => "Buffered clipboard item.".to_owned(),
+                            Ok(false) => {
+                                "Clipboard does not contain a supported image or file.".to_owned()
+                            }
                             Err(err) => format!("Paste failed: {err:#}"),
                         };
                         ui.set_status_text(status.into());
                     }
 
-                    let _ = event_tx.send(AppEvent::StorageChanged);
+                    if pasted {
+                        let _ = event_tx.send(AppEvent::StorageChanged);
+                    }
+                    return EventResult::PreventDefault;
+                }
+
+                if is_copy {
+                    let selected_index = ui_weak
+                        .upgrade()
+                        .map(|ui| ui.get_selected_index())
+                        .unwrap_or(-1);
+                    let copy_result = if let Ok(store) = store.lock() {
+                        if selected_index >= 0 {
+                            store.copy_to_clipboard(selected_index as usize).map(|_| true)
+                        } else {
+                            store.copy_latest_to_clipboard()
+                        }
+                    } else {
+                        Err(anyhow::anyhow!("storage lock is poisoned"))
+                    };
+
+                    if let Some(ui) = ui_weak.upgrade() {
+                        let status = match copy_result {
+                            Ok(true) if selected_index >= 0 => {
+                                "Copied selected item to the clipboard.".to_owned()
+                            }
+                            Ok(true) => "Copied latest item to the clipboard.".to_owned(),
+                            Ok(false) => "No buffered item is available to copy.".to_owned(),
+                            Err(err) => format!("Copy failed: {err:#}"),
+                        };
+                        ui.set_status_text(status.into());
+                    }
+
                     return EventResult::PreventDefault;
                 }
             }

@@ -110,14 +110,34 @@ impl ImageStore {
         self.persist_rgba_image(rgba_image, "Clipboard")
     }
 
-    pub fn add_current_clipboard_image(&mut self) -> anyhow::Result<bool> {
+    pub fn add_current_clipboard_item(&mut self) -> anyhow::Result<bool> {
         let mut clipboard = Clipboard::new()?;
-        let image = match clipboard.get_image() {
-            Ok(image) => image,
-            Err(_) => return Ok(false),
-        };
 
-        self.add_clipboard_image(image)
+        if let Ok(paths) = clipboard.get().file_list() {
+            let mut imported_any = false;
+            for path in paths {
+                imported_any |= self.import_path(&path, ImportMode::Copy)?;
+            }
+
+            if imported_any {
+                return Ok(true);
+            }
+        }
+
+        if let Ok(image) = clipboard.get_image() {
+            return self.add_clipboard_image(image);
+        }
+
+        if let Ok(text) = clipboard.get_text() {
+            let mut imported_any = false;
+            for path in extract_existing_paths_from_clipboard_text(&text) {
+                imported_any |= self.import_path(&path, ImportMode::Copy)?;
+            }
+
+            return Ok(imported_any);
+        }
+
+        Ok(false)
     }
 
     pub fn add_image_file(&mut self, path: &Path) -> anyhow::Result<bool> {
@@ -130,59 +150,19 @@ impl ImageStore {
         } else if looks_like_supported_text_path(path) || file_contains_text(path)? {
             self.add_text_file(path, mode)
         } else {
-            anyhow::bail!("{} is not a supported image or text file", path.display());
+            self.add_file_reference(path)
         }
     }
 
     pub fn add_file_reference(&mut self, path: &Path) -> anyhow::Result<bool> {
-        anyhow::ensure!(path.is_file(), "{} is not a regular file", path.display());
-
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let path_text = path.to_string_lossy().into_owned();
-        let hash = format!("file-{}", blake3::hash(path_text.as_bytes()).to_hex());
-
-        if self.promote_existing(&hash) {
-            return Ok(true);
-        }
-
-        let display_name = normalize_display_name(
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("File"),
-        );
-        let reference_path = self.file_refs_dir.join(format!("{hash}.path"));
-        let metadata_path = self.metadata_dir.join(format!("{hash}.txt"));
-        let metadata = fs::metadata(&path)
-            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
-        let file_extension = normalized_file_extension_from_name(&display_name);
-
-        fs::write(&reference_path, path_text.as_bytes())
-            .with_context(|| format!("failed to save {}", reference_path.display()))?;
-        fs::write(&metadata_path, &display_name)
-            .with_context(|| format!("failed to save {}", metadata_path.display()))?;
-
-        self.records.insert(
-            0,
-            StoredImage {
-                hash,
-                display_name,
-                width: 0,
-                height: 0,
-                kind: StoredImageKind::File,
-                original_path: path,
-                thumbnail_path: None,
-                reference_path: Some(reference_path),
-                text_preview: String::new(),
-                line_count: 0,
-                byte_len: metadata.len(),
-                file_extension,
-            },
-        );
-
-        Ok(true)
+        self.add_path_reference(path)
     }
 
     fn add_image_file_with_mode(&mut self, path: &Path, mode: ImportMode) -> anyhow::Result<bool> {
+        if mode == ImportMode::Copy {
+            return self.add_path_reference(path);
+        }
+
         let display_name = path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -207,6 +187,10 @@ impl ImageStore {
     }
 
     fn add_text_file(&mut self, path: &Path, mode: ImportMode) -> anyhow::Result<bool> {
+        if mode == ImportMode::Copy {
+            return self.add_path_reference(path);
+        }
+
         let encoded =
             fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         anyhow::ensure!(
@@ -266,6 +250,41 @@ impl ImageStore {
         );
 
         Ok(true)
+    }
+
+    fn add_path_reference(&mut self, path: &Path) -> anyhow::Result<bool> {
+        anyhow::ensure!(path.is_file(), "{} is not a regular file", path.display());
+
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path_text = path.to_string_lossy().into_owned();
+        let hash = format!("ref-{}", blake3::hash(path_text.as_bytes()).to_hex());
+        let reference_path = self.file_refs_dir.join(format!("{hash}.path"));
+        let metadata_path = self.metadata_dir.join(format!("{hash}.txt"));
+
+        if let Some(index) = self.records.iter().position(|record| record.hash == hash) {
+            if self.records[index].reference_path.is_none() {
+                return Ok(self.promote_existing(&hash));
+            }
+
+            let stale_record = self.records.remove(index);
+            if let Some(thumbnail_path) = stale_record.thumbnail_path {
+                remove_file_if_exists(thumbnail_path)?;
+            }
+        }
+
+        let mut record = self.build_reference_record(path, hash.clone())?;
+        fs::write(&reference_path, path_text.as_bytes())
+            .with_context(|| format!("failed to save {}", reference_path.display()))?;
+        fs::write(&metadata_path, &record.display_name)
+            .with_context(|| format!("failed to save {}", metadata_path.display()))?;
+        record.reference_path = Some(reference_path);
+
+        self.records.insert(0, record);
+        Ok(true)
+    }
+
+    fn build_reference_record(&self, path: PathBuf, hash: String) -> anyhow::Result<StoredImage> {
+        build_reference_record_from_disk(&path, &self.thumbnails_dir, &hash)
     }
 
     fn persist_gif_image(&mut self, path: &Path, display_name: &str) -> anyhow::Result<bool> {
@@ -382,17 +401,27 @@ impl ImageStore {
                 clipboard.set_text(text)?;
             }
             StoredImageKind::File => {
-                clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
+                if record.reference_path.is_some() {
+                    clipboard.set().file_list(&[record.original_path.clone()])?;
+                } else {
+                    clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
+                }
             }
             StoredImageKind::Gif | StoredImageKind::Raster => {
-                let rgba = image::open(&record.original_path)
-                    .with_context(|| format!("failed to open {}", record.original_path.display()))?
-                    .to_rgba8();
-                clipboard.set_image(ImageData {
-                    width: rgba.width() as usize,
-                    height: rgba.height() as usize,
-                    bytes: Cow::Owned(rgba.into_raw()),
-                })?;
+                if record.reference_path.is_some() {
+                    clipboard.set().file_list(&[record.original_path.clone()])?;
+                } else {
+                    let rgba = image::open(&record.original_path)
+                        .with_context(|| {
+                            format!("failed to open {}", record.original_path.display())
+                        })?
+                        .to_rgba8();
+                    clipboard.set_image(ImageData {
+                        width: rgba.width() as usize,
+                        height: rgba.height() as usize,
+                        bytes: Cow::Owned(rgba.into_raw()),
+                    })?;
+                }
             }
         }
 
@@ -430,7 +459,7 @@ impl ImageStore {
         }
 
         let record = self.records.remove(index);
-        if record.kind != StoredImageKind::File {
+        if record.reference_path.is_none() {
             remove_file_if_exists(record.original_path)?;
         }
         if let Some(thumbnail_path) = record.thumbnail_path {
@@ -445,7 +474,7 @@ impl ImageStore {
 
     pub fn clear(&mut self) -> anyhow::Result<()> {
         for record in self.records.drain(..) {
-            if record.kind != StoredImageKind::File {
+            if record.reference_path.is_none() {
                 remove_file_if_exists(record.original_path)?;
             }
             if let Some(thumbnail_path) = record.thumbnail_path {
@@ -473,7 +502,27 @@ impl ImageStore {
             self.records.insert(0, record);
         }
 
+        let reference_path = self.records[0].reference_path.clone();
+        let _ = self.touch_record_recency(hash, reference_path.as_deref());
+
         true
+    }
+
+    fn touch_record_recency(
+        &self,
+        hash: &str,
+        reference_path: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        if let Some(reference_path) = reference_path {
+            touch_file(reference_path)?;
+        }
+
+        let metadata_path = self.metadata_dir.join(format!("{hash}.txt"));
+        if metadata_path.exists() {
+            touch_file(&metadata_path)?;
+        }
+
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -487,6 +536,23 @@ fn remove_file_if_exists(path: PathBuf) -> anyhow::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn touch_file(path: &Path) -> anyhow::Result<()> {
+    let encoded = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    fs::write(path, encoded).with_context(|| format!("failed to save {}", path.display()))?;
+    Ok(())
+}
+
+fn move_file(from: &Path, to: &Path) -> anyhow::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(from, to).with_context(|| format!("failed to save {}", to.display()))?;
+            remove_file_if_exists(from.to_path_buf())?;
+            Ok(())
+        }
     }
 }
 
@@ -528,27 +594,163 @@ fn reveal_path_in_file_manager(path: &Path) -> anyhow::Result<()> {
     Err(anyhow!("revealing files is not supported on this platform"))
 }
 
-fn move_file(from: &Path, to: &Path) -> anyhow::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(from, to).with_context(|| format!("failed to save {}", to.display()))?;
-            remove_file_if_exists(from.to_path_buf())?;
-            Ok(())
-        }
-    }
+fn record_recency(primary: Option<PathBuf>, fallback: PathBuf) -> SystemTime {
+    primary
+        .as_deref()
+        .and_then(file_modified_time)
+        .or_else(|| file_modified_time(&fallback))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn file_modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
 }
 
 fn should_remove_source(path: &Path, mode: ImportMode, store_root: &Path) -> bool {
     mode == ImportMode::Move && !path.starts_with(store_root)
 }
 
-pub fn image_fingerprint(width: usize, height: usize, bytes: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&width.to_le_bytes());
-    hasher.update(&height.to_le_bytes());
-    hasher.update(bytes);
-    hasher.finalize().to_hex().to_string()
+fn build_reference_record_from_disk(
+    path: &Path,
+    thumbnails_dir: &Path,
+    hash: &str,
+) -> anyhow::Result<StoredImage> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let kind = classify_file_kind(path)?;
+
+    match kind {
+        StoredImageKind::Gif | StoredImageKind::Raster => {
+            let rgba = image::open(path)
+                .with_context(|| format!("failed to decode {}", path.display()))?
+                .to_rgba8();
+            let thumbnail_path = thumbnails_dir.join(format!("{hash}.png"));
+            imageops::thumbnail(&rgba, 196, 196)
+                .save(&thumbnail_path)
+                .with_context(|| format!("failed to save {}", thumbnail_path.display()))?;
+
+            Ok(StoredImage {
+                hash: hash.to_owned(),
+                display_name: normalize_display_name(
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Imported image"),
+                ),
+                width: rgba.width(),
+                height: rgba.height(),
+                kind,
+                original_path: path.to_path_buf(),
+                thumbnail_path: Some(thumbnail_path),
+                reference_path: None,
+                text_preview: String::new(),
+                line_count: 0,
+                byte_len: metadata.len(),
+                file_extension: path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .unwrap_or_else(|| "png".to_owned()),
+            })
+        }
+        StoredImageKind::Text => {
+            let encoded =
+                fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            anyhow::ensure!(
+                looks_like_text_bytes(&encoded),
+                "{} does not look like a text file",
+                path.display(),
+            );
+            let text = std::str::from_utf8(&encoded)
+                .with_context(|| format!("{} is not valid UTF-8 text", path.display()))?;
+
+            Ok(StoredImage {
+                hash: hash.to_owned(),
+                display_name: normalize_display_name(
+                    path.file_stem()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Text file"),
+                ),
+                width: 0,
+                height: 0,
+                kind,
+                original_path: path.to_path_buf(),
+                thumbnail_path: None,
+                reference_path: None,
+                text_preview: build_text_preview(text),
+                line_count: text.lines().count(),
+                byte_len: encoded.len() as u64,
+                file_extension: normalized_text_extension(path),
+            })
+        }
+        StoredImageKind::File => {
+            let display_name = normalize_display_name(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("File"),
+            );
+            let file_extension = normalized_file_extension(path, &display_name);
+
+            Ok(StoredImage {
+                hash: hash.to_owned(),
+                display_name,
+                width: 0,
+                height: 0,
+                kind,
+                original_path: path.to_path_buf(),
+                thumbnail_path: None,
+                reference_path: None,
+                text_preview: String::new(),
+                line_count: 0,
+                byte_len: metadata.len(),
+                file_extension,
+            })
+        }
+    }
+}
+
+fn classify_file_kind(path: &Path) -> anyhow::Result<StoredImageKind> {
+    if is_gif_file(path) {
+        Ok(StoredImageKind::Gif)
+    } else if is_supported_image_file(path) {
+        Ok(StoredImageKind::Raster)
+    } else if looks_like_supported_text_path(path) || file_contains_text(path)? {
+        Ok(StoredImageKind::Text)
+    } else {
+        Ok(StoredImageKind::File)
+    }
+}
+
+fn extract_existing_paths_from_clipboard_text(text: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for line in text.lines() {
+        let Some(candidate) = parse_clipboard_path_candidate(line) else {
+            continue;
+        };
+        let path = candidate.canonicalize().unwrap_or(candidate);
+        if path.is_file() && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
+fn parse_clipboard_path_candidate(text: &str) -> Option<PathBuf> {
+    let candidate = text.trim().trim_matches(|ch| matches!(ch, '"' | '\''));
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
+
+    #[cfg(target_os = "windows")]
+    let candidate = candidate
+        .strip_prefix('/')
+        .filter(|trimmed| trimmed.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(candidate);
+
+    Some(PathBuf::from(candidate))
 }
 
 fn load_records(
@@ -586,7 +788,7 @@ fn load_records(
             continue;
         }
 
-        match load_file_record(&path, metadata_dir) {
+        match load_reference_record(&path, thumbnails_dir, metadata_dir) {
             Ok(Some(record)) => records.push(record),
             Ok(None) => {}
             Err(err) => eprintln!("skipping file reference {}: {err:#}", path.display()),
@@ -634,10 +836,10 @@ fn load_record(
             .with_context(|| format!("failed to save {}", thumbnail_path.display()))?;
     }
 
-    let modified = fs::metadata(original_path)
-        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let modified = record_recency(
+        Some(metadata_dir.join(format!("{hash}.txt"))),
+        original_path.to_path_buf(),
+    );
 
     Ok(Some((
         modified,
@@ -678,10 +880,10 @@ fn load_text_record(
     );
     let text = std::str::from_utf8(&encoded)
         .with_context(|| format!("{} is not valid UTF-8 text", original_path.display()))?;
-    let modified = fs::metadata(original_path)
-        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?
-        .modified()
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let modified = record_recency(
+        Some(metadata_dir.join(format!("{hash}.txt"))),
+        original_path.to_path_buf(),
+    );
 
     Ok(Some((
         modified,
@@ -702,8 +904,9 @@ fn load_text_record(
     )))
 }
 
-fn load_file_record(
+fn load_reference_record(
     reference_path: &Path,
+    thumbnails_dir: &Path,
     metadata_dir: &Path,
 ) -> anyhow::Result<Option<(SystemTime, StoredImage)>> {
     let Some(hash) = reference_path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -712,29 +915,16 @@ fn load_file_record(
     let path_text = fs::read_to_string(reference_path)
         .with_context(|| format!("failed to read {}", reference_path.display()))?;
     let original_path = PathBuf::from(path_text);
-    let metadata = fs::metadata(&original_path)
-        .with_context(|| format!("failed to read metadata for {}", original_path.display()))?;
-    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let display_name = load_display_name(metadata_dir.join(format!("{hash}.txt")), hash);
-    let file_extension = normalized_file_extension(&original_path, &display_name);
+    if !original_path.is_file() {
+        return Ok(None);
+    }
 
-    Ok(Some((
-        modified,
-        StoredImage {
-            hash: hash.to_owned(),
-            display_name,
-            width: 0,
-            height: 0,
-            kind: StoredImageKind::File,
-            original_path,
-            thumbnail_path: None,
-            reference_path: Some(reference_path.to_path_buf()),
-            text_preview: String::new(),
-            line_count: 0,
-            byte_len: metadata.len(),
-            file_extension,
-        },
-    )))
+    let mut record = build_reference_record_from_disk(&original_path, thumbnails_dir, hash)?;
+    record.display_name = load_display_name(metadata_dir.join(format!("{hash}.txt")), hash);
+    record.reference_path = Some(reference_path.to_path_buf());
+    let modified = record_recency(None, reference_path.to_path_buf());
+
+    Ok(Some((modified, record)))
 }
 
 fn is_supported_image_file(path: &Path) -> bool {
@@ -1058,11 +1248,16 @@ mod tests {
             let input_gif = root.join("sample.gif");
             fs::create_dir_all(&root)?;
             write_test_gif(&input_gif)?;
+            let canonical_input = input_gif
+                .canonicalize()
+                .unwrap_or_else(|_| input_gif.clone());
 
             let mut store = ImageStore::open_at(root.join("store"))?;
             assert!(store.add_image_file(&input_gif)?);
             assert_eq!(store.records.len(), 1);
             assert_eq!(store.records[0].kind, StoredImageKind::Gif);
+            assert_eq!(store.records[0].original_path, canonical_input);
+            assert!(store.records[0].reference_path.is_some());
             assert_eq!(
                 store.records[0]
                     .original_path
@@ -1074,6 +1269,8 @@ mod tests {
             let reopened = ImageStore::open_at(root.join("store"))?;
             assert_eq!(reopened.records.len(), 1);
             assert_eq!(reopened.records[0].kind, StoredImageKind::Gif);
+            assert_eq!(reopened.records[0].original_path, canonical_input);
+            assert!(reopened.records[0].reference_path.is_some());
             assert_eq!(
                 reopened.records[0]
                     .original_path
@@ -1099,6 +1296,9 @@ mod tests {
                 &input_file,
                 "fn main() {\n    println!(\"hello from pictray\");\n}\n",
             )?;
+            let canonical_input = input_file
+                .canonicalize()
+                .unwrap_or_else(|_| input_file.clone());
 
             let mut store = ImageStore::open_at(root.join("store"))?;
             assert!(store.import_path(&input_file, ImportMode::Copy)?);
@@ -1106,6 +1306,8 @@ mod tests {
             assert_eq!(store.records[0].kind, StoredImageKind::Text);
             assert_eq!(store.records[0].file_extension, "rs");
             assert!(store.records[0].thumbnail_path.is_none());
+            assert_eq!(store.records[0].original_path, canonical_input);
+            assert!(store.records[0].reference_path.is_some());
             assert!(store.records[0].text_preview.contains("println!"));
             assert!(input_file.exists());
 
@@ -1113,6 +1315,8 @@ mod tests {
             assert_eq!(reopened.records.len(), 1);
             assert_eq!(reopened.records[0].kind, StoredImageKind::Text);
             assert_eq!(reopened.records[0].file_extension, "rs");
+            assert_eq!(reopened.records[0].original_path, canonical_input);
+            assert!(reopened.records[0].reference_path.is_some());
             assert!(reopened.records[0].text_preview.contains("println!"));
 
             Ok(())
