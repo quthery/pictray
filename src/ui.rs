@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::HashMap,
     fs::File,
     io::BufReader,
     path::PathBuf,
@@ -12,8 +13,8 @@ use crossbeam_channel::Receiver;
 use image::{AnimationDecoder, codecs::gif::GifDecoder, imageops};
 use slint::winit_030::{WinitWindowAccessor, winit};
 use slint::{
-    ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode,
-    VecModel,
+    ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, Timer,
+    TimerMode, VecModel,
 };
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
 
 pub struct PreviewDriver {
     _timer: Timer,
+    _model: Rc<VecModel<ImageTile>>,
 }
 
 pub fn ensure_window_stays_on_top(ui: &MainWindow) {
@@ -44,15 +46,12 @@ pub fn apply_native_background_effects(ui: &MainWindow) {
 fn apply_native_background_effects_to_window(window: &winit::window::Window) {
     #[cfg(target_os = "windows")]
     {
-        use slint::winit_030::winit::platform::windows::{BackdropType, WindowExtWindows};
-
-        window.set_system_backdrop(BackdropType::TransientWindow);
+        crate::window_effects::apply_to_window(window);
     }
 
     #[cfg(target_os = "macos")]
     {
-        window.set_transparent(true);
-        window.set_blur(true);
+        crate::window_effects::apply_to_window(window);
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -102,12 +101,38 @@ struct CachedTile {
     line_numbers: SharedString,
     is_text: bool,
     is_file: bool,
+    has_thumbnail: bool,
     image: CachedTileImage,
+}
+
+impl Clone for CachedTile {
+    fn clone(&self) -> Self {
+        Self {
+            title: self.title.clone(),
+            subtitle: self.subtitle.clone(),
+            badge: self.badge.clone(),
+            preview: self.preview.clone(),
+            line_numbers: self.line_numbers.clone(),
+            is_text: self.is_text,
+            is_file: self.is_file,
+            has_thumbnail: self.has_thumbnail,
+            image: self.image.clone(),
+        }
+    }
 }
 
 enum CachedTileImage {
     Static(Image),
     Animated(AnimatedPreview),
+}
+
+impl Clone for CachedTileImage {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Static(image) => Self::Static(image.clone()),
+            Self::Animated(animated) => Self::Animated(animated.clone()),
+        }
+    }
 }
 
 struct AnimatedPreview {
@@ -116,53 +141,102 @@ struct AnimatedPreview {
     next_frame_at: Instant,
 }
 
+impl Clone for AnimatedPreview {
+    fn clone(&self) -> Self {
+        Self {
+            frames: self.frames.clone(),
+            current_frame: self.current_frame,
+            next_frame_at: self.next_frame_at,
+        }
+    }
+}
+
 struct AnimatedFrame {
     image: Image,
     delay: Duration,
 }
 
+impl Clone for AnimatedFrame {
+    fn clone(&self) -> Self {
+        Self {
+            image: self.image.clone(),
+            delay: self.delay,
+        }
+    }
+}
+
+const TILE_HEIGHT: f32 = 168.0;
+const TILE_HEIGHT_SELECTED: f32 = 214.0;
+const TILE_SPACING: f32 = 8.0;
+
 impl PreviewState {
     fn sync(&mut self, records: Vec<StoredImage>) {
-        self.tiles = records.iter().map(load_tile_preview).collect();
+        let cached_tiles: HashMap<_, _> = self
+            .records
+            .drain(..)
+            .zip(self.tiles.drain(..))
+            .map(|(record, tile)| (record.hash.clone(), (record, tile)))
+            .collect();
+
+        self.tiles = records
+            .iter()
+            .map(|record| match cached_tiles.get(&record.hash) {
+                Some((cached_record, cached_tile)) if cached_record == record => {
+                    cached_tile.clone()
+                }
+                _ => load_tile_preview(record),
+            })
+            .collect();
         self.records = records;
     }
 
-    fn advance_animations(&mut self, now: Instant) -> bool {
-        let mut changed = false;
+    fn advance_animations(&mut self, now: Instant) -> Vec<usize> {
+        let mut changed_rows = Vec::new();
 
-        for tile in &mut self.tiles {
+        for (index, tile) in self.tiles.iter_mut().enumerate() {
             let CachedTileImage::Animated(animated) = &mut tile.image else {
                 continue;
             };
 
+            let mut row_changed = false;
             while now >= animated.next_frame_at {
                 animated.current_frame = (animated.current_frame + 1) % animated.frames.len();
                 animated.next_frame_at += animated.frames[animated.current_frame].delay;
-                changed = true;
+                row_changed = true;
+            }
+
+            if row_changed {
+                changed_rows.push(index);
             }
         }
 
-        changed
+        changed_rows
     }
 
     fn render_tiles(&self) -> Vec<ImageTile> {
-        self.tiles
-            .iter()
-            .map(|tile| ImageTile {
-                title: tile.title.clone(),
-                subtitle: tile.subtitle.clone(),
-                badge: tile.badge.clone(),
-                preview: tile.preview.clone(),
-                line_numbers: tile.line_numbers.clone(),
-                is_text: tile.is_text,
-                is_file: tile.is_file,
-                thumbnail: tile.current_image(),
-            })
-            .collect()
+        self.tiles.iter().map(CachedTile::render).collect()
+    }
+
+    fn render_tile(&self, index: usize) -> Option<ImageTile> {
+        self.tiles.get(index).map(CachedTile::render)
     }
 }
 
 impl CachedTile {
+    fn render(&self) -> ImageTile {
+        ImageTile {
+            title: self.title.clone(),
+            subtitle: self.subtitle.clone(),
+            badge: self.badge.clone(),
+            preview: self.preview.clone(),
+            line_numbers: self.line_numbers.clone(),
+            is_text: self.is_text,
+            is_file: self.is_file,
+            has_thumbnail: self.has_thumbnail,
+            thumbnail: self.current_image(),
+        }
+    }
+
     fn current_image(&self) -> Image {
         match &self.image {
             CachedTileImage::Static(image) => image.clone(),
@@ -261,6 +335,23 @@ pub fn install_ui_callbacks(
         }
     });
 
+    let open_store = Arc::clone(&store);
+    let open_ui_weak = ui.as_weak();
+    ui.on_open_image(move |index| {
+        let status = match open_store.lock() {
+            Ok(store) => match store.open_in_associated_app(index as usize) {
+                Ok(()) => "Opened item in its app.".to_owned(),
+                Err(err) => format!("Open failed: {err:#}"),
+            },
+            Err(_) => "Open failed: storage lock is poisoned.".to_owned(),
+        };
+
+        if let Some(ui) = open_ui_weak.upgrade() {
+            ui.set_selected_index(-1);
+            ui.set_status_text(status.into());
+        }
+    });
+
     let delete_store = Arc::clone(&store);
     let delete_tx = event_tx.clone();
     let delete_ui_weak = ui.as_weak();
@@ -305,6 +396,74 @@ pub fn install_ui_callbacks(
             };
             ui.set_selected_index(next_index);
         }
+    });
+
+    let reorder_store = Arc::clone(&store);
+    let reorder_tx = event_tx.clone();
+    let reorder_ui_weak = ui.as_weak();
+    ui.on_reorder_image(move |from_index, pointer_y| {
+        let selected_index = reorder_ui_weak
+            .upgrade()
+            .map(|ui| ui.get_selected_index())
+            .unwrap_or(-1);
+
+        let (status, changed) = match reorder_store.lock() {
+            Ok(mut store) => {
+                let item_count = store.records().len();
+                if item_count < 2 {
+                    (
+                        "Need at least two buffered items to reorder.".to_owned(),
+                        false,
+                    )
+                } else if from_index < 0 || from_index as usize >= item_count {
+                    (
+                        "Reorder failed: dragged item is no longer available.".to_owned(),
+                        false,
+                    )
+                } else {
+                    let target_index = reorder_target_index(pointer_y, item_count, selected_index);
+                    match store.move_record(from_index as usize, target_index) {
+                        Ok(true) => (
+                            format!("Moved item to position {}.", target_index + 1),
+                            true,
+                        ),
+                        Ok(false) => ("Item stayed in the same position.".to_owned(), false),
+                        Err(err) => (format!("Reorder failed: {err:#}"), false),
+                    }
+                }
+            }
+            Err(_) => (
+                "Reorder failed: storage lock is poisoned.".to_owned(),
+                false,
+            ),
+        };
+
+        if let Some(ui) = reorder_ui_weak.upgrade() {
+            ui.set_status_text(status.into());
+        }
+        if changed {
+            let _ = reorder_tx.send(AppEvent::StorageChanged);
+        }
+    });
+
+    let move_up_store = Arc::clone(&store);
+    let move_up_tx = event_tx.clone();
+    let move_up_ui_weak = ui.as_weak();
+    ui.on_move_image_up(move |index| {
+        move_item_by_offset(&move_up_store, &move_up_ui_weak, &move_up_tx, index, -1);
+    });
+
+    let move_down_store = Arc::clone(&store);
+    let move_down_tx = event_tx.clone();
+    let move_down_ui_weak = ui.as_weak();
+    ui.on_move_image_down(move |index| {
+        move_item_by_offset(
+            &move_down_store,
+            &move_down_ui_weak,
+            &move_down_tx,
+            index,
+            1,
+        );
     });
 
     let clear_ui_weak = ui.as_weak();
@@ -360,18 +519,30 @@ pub fn install_ui_callbacks(
 
 pub fn install_preview_driver(ui: &MainWindow, store: Arc<Mutex<ImageStore>>) -> PreviewDriver {
     let timer = Timer::default();
+    let model = Rc::new(VecModel::from(Vec::<ImageTile>::new()));
     let state = Rc::new(RefCell::new(PreviewState::default()));
     let ui_weak = ui.as_weak();
     let state_for_timer = Rc::clone(&state);
     let store_for_timer = Arc::clone(&store);
+    let model_for_timer = Rc::clone(&model);
 
-    refresh_previews(&ui_weak, &store, &state);
+    ui.set_images(ModelRc::from(model.clone()));
+
+    refresh_previews(&ui_weak, &store, &state, &model);
 
     timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
-        refresh_previews(&ui_weak, &store_for_timer, &state_for_timer)
+        refresh_previews(
+            &ui_weak,
+            &store_for_timer,
+            &state_for_timer,
+            &model_for_timer,
+        )
     });
 
-    PreviewDriver { _timer: timer }
+    PreviewDriver {
+        _timer: timer,
+        _model: model,
+    }
 }
 
 pub fn start_event_bridge(
@@ -476,6 +647,7 @@ fn refresh_previews(
     ui_weak: &slint::Weak<MainWindow>,
     store: &Arc<Mutex<ImageStore>>,
     state: &Rc<RefCell<PreviewState>>,
+    model: &Rc<VecModel<ImageTile>>,
 ) {
     let records = match store.lock() {
         Ok(store) => store.records().to_vec(),
@@ -484,23 +656,103 @@ fn refresh_previews(
 
     let now = Instant::now();
     let mut state = state.borrow_mut();
-    let mut dirty = false;
     let records_changed = records != state.records;
 
     if records_changed {
         state.sync(records);
-        dirty = true;
     }
 
-    dirty |= state.advance_animations(now);
+    let changed_rows = if records_changed {
+        Vec::new()
+    } else {
+        state.advance_animations(now)
+    };
 
-    if dirty {
+    if records_changed {
+        model.set_vec(state.render_tiles());
         if let Some(ui) = ui_weak.upgrade() {
-            ui.set_images(ModelRc::new(VecModel::from(state.render_tiles())));
-            if records_changed {
-                ui.set_selected_index(-1);
+            ui.set_selected_index(-1);
+        }
+        return;
+    }
+
+    for row in changed_rows {
+        if let Some(tile) = state.render_tile(row) {
+            model.set_row_data(row, tile);
+        }
+    }
+}
+
+fn reorder_target_index(pointer_y: f32, item_count: usize, selected_index: i32) -> usize {
+    if item_count == 0 {
+        return 0;
+    }
+
+    let mut current_y = 0.0;
+    for index in 0..item_count {
+        let height = if selected_index == index as i32 {
+            TILE_HEIGHT_SELECTED
+        } else {
+            TILE_HEIGHT
+        };
+        let midpoint = current_y + (height / 2.0);
+        if pointer_y <= midpoint {
+            return index;
+        }
+        current_y += height + TILE_SPACING;
+    }
+
+    item_count.saturating_sub(1)
+}
+
+fn move_item_by_offset(
+    store: &Arc<Mutex<ImageStore>>,
+    ui_weak: &slint::Weak<MainWindow>,
+    event_tx: &crossbeam_channel::Sender<AppEvent>,
+    index: i32,
+    offset: isize,
+) {
+    let (status, changed) = match store.lock() {
+        Ok(mut store) => {
+            let item_count = store.records().len();
+            if item_count < 2 {
+                (
+                    "Need at least two buffered items to reorder.".to_owned(),
+                    false,
+                )
+            } else if index < 0 || index as usize >= item_count {
+                (
+                    "Move failed: selected item is no longer available.".to_owned(),
+                    false,
+                )
+            } else {
+                let from_index = index as usize;
+                let target_index = if offset.is_negative() {
+                    from_index.saturating_sub(offset.unsigned_abs())
+                } else {
+                    from_index
+                        .saturating_add(offset as usize)
+                        .min(item_count.saturating_sub(1))
+                };
+
+                match store.move_record(from_index, target_index) {
+                    Ok(true) => (
+                        format!("Moved item to position {}.", target_index + 1),
+                        true,
+                    ),
+                    Ok(false) => ("Item stayed in the same position.".to_owned(), false),
+                    Err(err) => (format!("Move failed: {err:#}"), false),
+                }
             }
         }
+        Err(_) => ("Move failed: storage lock is poisoned.".to_owned(), false),
+    };
+
+    if let Some(ui) = ui_weak.upgrade() {
+        ui.set_status_text(status.into());
+    }
+    if changed {
+        let _ = event_tx.send(AppEvent::StorageChanged);
     }
 }
 
@@ -529,12 +781,19 @@ fn load_tile_preview(record: &StoredImage) -> CachedTile {
     };
     let is_text = record.kind == StoredImageKind::Text;
     let is_file = record.kind == StoredImageKind::File;
+    let has_thumbnail = record
+        .thumbnail_path
+        .as_ref()
+        .is_some_and(|path| path.is_file());
 
     let image = match record.kind {
         StoredImageKind::Gif => load_animated_preview(record)
             .map(CachedTileImage::Animated)
             .unwrap_or_else(|| CachedTileImage::Static(load_static_preview_image(record))),
         StoredImageKind::Raster => CachedTileImage::Static(load_static_preview_image(record)),
+        StoredImageKind::File if has_thumbnail => {
+            CachedTileImage::Static(load_static_preview_image(record))
+        }
         StoredImageKind::Text | StoredImageKind::File => CachedTileImage::Static(Image::default()),
     };
 
@@ -546,6 +805,7 @@ fn load_tile_preview(record: &StoredImage) -> CachedTile {
         line_numbers,
         is_text,
         is_file,
+        has_thumbnail,
         image,
     }
 }
@@ -718,4 +978,78 @@ fn image_from_rgba((width, height, rgba): (u32, u32, Vec<u8>)) -> Image {
     let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
     buffer.make_mut_bytes().copy_from_slice(&rgba);
     Image::from_rgba8(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sample_record(hash: &str, display_name: &str) -> StoredImage {
+        StoredImage {
+            hash: hash.to_owned(),
+            display_name: display_name.to_owned(),
+            width: 10,
+            height: 10,
+            kind: StoredImageKind::Raster,
+            original_path: PathBuf::from(format!("/tmp/{hash}.png")),
+            thumbnail_path: None,
+            reference_path: None,
+            text_preview: String::new(),
+            line_count: 0,
+            byte_len: 4,
+            file_extension: "png".to_owned(),
+        }
+    }
+
+    #[test]
+    fn sync_reuses_cached_tiles_when_records_are_reordered() {
+        let first = sample_record("first", "First");
+        let second = sample_record("second", "Second");
+        let original_next_frame_at = Instant::now() + Duration::from_secs(5);
+
+        let mut state = PreviewState {
+            records: vec![first.clone(), second.clone()],
+            tiles: vec![
+                CachedTile {
+                    title: "First".into(),
+                    subtitle: "10x10".into(),
+                    badge: "PNG".into(),
+                    preview: SharedString::default(),
+                    line_numbers: SharedString::default(),
+                    is_text: false,
+                    is_file: false,
+                    has_thumbnail: true,
+                    image: CachedTileImage::Static(Image::default()),
+                },
+                CachedTile {
+                    title: "Second".into(),
+                    subtitle: "10x10".into(),
+                    badge: "GIF".into(),
+                    preview: SharedString::default(),
+                    line_numbers: SharedString::default(),
+                    is_text: false,
+                    is_file: false,
+                    has_thumbnail: true,
+                    image: CachedTileImage::Animated(AnimatedPreview {
+                        frames: vec![AnimatedFrame {
+                            image: Image::default(),
+                            delay: Duration::from_millis(100),
+                        }],
+                        current_frame: 0,
+                        next_frame_at: original_next_frame_at,
+                    }),
+                },
+            ],
+        };
+
+        state.sync(vec![second, first]);
+
+        match &state.tiles[0].image {
+            CachedTileImage::Animated(animated) => {
+                assert_eq!(animated.next_frame_at, original_next_frame_at);
+            }
+            CachedTileImage::Static(_) => panic!("expected animated tile to be preserved"),
+        }
+    }
 }

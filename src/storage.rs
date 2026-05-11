@@ -1,9 +1,10 @@
 use std::{
     borrow::Cow,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, anyhow};
@@ -63,6 +64,12 @@ pub struct ImageStore {
     metadata_dir: PathBuf,
     file_refs_dir: PathBuf,
     records: Vec<StoredImage>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardCopyTarget {
+    ItemContents,
+    FileList(Vec<PathBuf>),
 }
 
 impl ImageStore {
@@ -393,9 +400,12 @@ impl ImageStore {
             .ok_or_else(|| anyhow!("image index {index} does not exist"))?;
         let mut clipboard = Clipboard::new()?;
 
-        if record.reference_path.is_some() {
-            clipboard.set_text(record.original_path.to_string_lossy().into_owned())?;
-            return Ok(());
+        match clipboard_copy_target(record) {
+            ClipboardCopyTarget::FileList(paths) => {
+                clipboard.set().file_list(&paths)?;
+                return Ok(());
+            }
+            ClipboardCopyTarget::ItemContents => {}
         }
 
         match record.kind {
@@ -432,12 +442,35 @@ impl ImageStore {
         Ok(true)
     }
 
+    pub fn move_record(&mut self, from: usize, to: usize) -> anyhow::Result<bool> {
+        if from >= self.records.len() || to >= self.records.len() {
+            return Ok(false);
+        }
+
+        if from == to {
+            return Ok(false);
+        }
+
+        let record = self.records.remove(from);
+        self.records.insert(to, record);
+        self.persist_record_order()?;
+        Ok(true)
+    }
+
     pub fn drag_path(&self, index: usize) -> anyhow::Result<PathBuf> {
         let record = self
             .records
             .get(index)
             .ok_or_else(|| anyhow!("item index {index} does not exist"))?;
         Ok(record.original_path.clone())
+    }
+
+    pub fn open_in_associated_app(&self, index: usize) -> anyhow::Result<()> {
+        let record = self
+            .records
+            .get(index)
+            .ok_or_else(|| anyhow!("item index {index} does not exist"))?;
+        open_path_in_associated_app(record)
     }
 
     pub fn reveal_in_file_manager(&self, index: usize) -> anyhow::Result<()> {
@@ -520,6 +553,19 @@ impl ImageStore {
         Ok(())
     }
 
+    fn persist_record_order(&self) -> anyhow::Result<()> {
+        let delay = Duration::from_millis(4);
+
+        for (position, record) in self.records.iter().rev().enumerate() {
+            self.touch_record_recency(&record.hash, record.reference_path.as_deref())?;
+            if position + 1 < self.records.len() {
+                std::thread::sleep(delay);
+            }
+        }
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn root(&self) -> &PathBuf {
         &self.root
@@ -587,6 +633,53 @@ fn reveal_path_in_file_manager(path: &Path) -> anyhow::Result<()> {
 
     #[allow(unreachable_code)]
     Err(anyhow!("revealing files is not supported on this platform"))
+}
+
+fn open_path_in_associated_app(record: &StoredImage) -> anyhow::Result<()> {
+    let path = &record.original_path;
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        if matches!(record.kind, StoredImageKind::Raster | StoredImageKind::Gif)
+            || is_pdf_file(path)
+        {
+            command.arg("-a").arg("Preview");
+        }
+
+        let status = command
+            .arg(path)
+            .status()
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        anyhow::ensure!(status.success(), "failed to open {}", path.display());
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(path)
+            .status()
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        anyhow::ensure!(status.success(), "failed to open {}", path.display());
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let status = Command::new("xdg-open")
+            .arg(path)
+            .status()
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        anyhow::ensure!(status.success(), "failed to open {}", path.display());
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow!("opening files is not supported on this platform"))
 }
 
 fn record_recency(primary: Option<PathBuf>, fallback: PathBuf) -> SystemTime {
@@ -684,6 +777,11 @@ fn build_reference_record_from_disk(
                     .unwrap_or("File"),
             );
             let file_extension = normalized_file_extension(path, &display_name);
+            let thumbnail_path = if is_pdf_file(path) {
+                render_pdf_head_thumbnail(path, thumbnails_dir, hash)?
+            } else {
+                None
+            };
 
             Ok(StoredImage {
                 hash: hash.to_owned(),
@@ -692,7 +790,7 @@ fn build_reference_record_from_disk(
                 height: 0,
                 kind,
                 original_path: path.to_path_buf(),
-                thumbnail_path: None,
+                thumbnail_path,
                 reference_path: None,
                 text_preview: String::new(),
                 line_count: 0,
@@ -703,11 +801,176 @@ fn build_reference_record_from_disk(
     }
 }
 
+fn render_pdf_head_thumbnail(
+    path: &Path,
+    thumbnails_dir: &Path,
+    hash: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let thumbnail_path = thumbnails_dir.join(format!("{hash}.png"));
+    if thumbnail_path.exists() {
+        return Ok(Some(thumbnail_path));
+    }
+
+    let render_dir =
+        std::env::temp_dir().join(format!("pictray-pdf-preview-{}-{hash}", std::process::id()));
+    fs::create_dir_all(&render_dir)
+        .with_context(|| format!("failed to create {}", render_dir.display()))?;
+
+    let result = if let Some(rendered_path) = render_pdf_first_page(path, &render_dir) {
+        let rendered = image::open(&rendered_path)
+            .with_context(|| format!("failed to decode {}", rendered_path.display()))?
+            .to_rgba8();
+        let crop_height = (rendered.height().saturating_mul(9) / 20).max(1);
+        let head = imageops::crop_imm(&rendered, 0, 0, rendered.width(), crop_height).to_image();
+        imageops::thumbnail(&head, 260, 160)
+            .save(&thumbnail_path)
+            .with_context(|| format!("failed to save {}", thumbnail_path.display()))?;
+        Some(thumbnail_path)
+    } else {
+        None
+    };
+
+    let _ = fs::remove_dir_all(render_dir);
+    Ok(result)
+}
+
+fn render_pdf_first_page(path: &Path, render_dir: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        if run_quicklook_renderer(path, render_dir) {
+            return find_generated_png(render_dir);
+        }
+    }
+
+    let output_path = render_dir.join("page.png");
+    if run_pdftoppm_renderer(path, render_dir) {
+        return Some(output_path);
+    }
+    if run_mutool_renderer(path, &output_path) {
+        return Some(output_path);
+    }
+    if run_imagemagick_renderer(path, &output_path) {
+        return Some(output_path);
+    }
+    if run_ghostscript_renderer(path, &output_path) {
+        return Some(output_path);
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn run_quicklook_renderer(path: &Path, render_dir: &Path) -> bool {
+    Command::new("qlmanage")
+        .arg("-t")
+        .arg("-s")
+        .arg("512")
+        .arg("-o")
+        .arg(render_dir)
+        .arg(path)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn run_pdftoppm_renderer(path: &Path, render_dir: &Path) -> bool {
+    let output_prefix = render_dir.join("page");
+    Command::new("pdftoppm")
+        .arg("-f")
+        .arg("1")
+        .arg("-l")
+        .arg("1")
+        .arg("-singlefile")
+        .arg("-png")
+        .arg("-scale-to")
+        .arg("512")
+        .arg(path)
+        .arg(&output_prefix)
+        .status()
+        .is_ok_and(|status| status.success() && output_prefix.with_extension("png").is_file())
+}
+
+fn run_mutool_renderer(path: &Path, output_path: &Path) -> bool {
+    Command::new("mutool")
+        .arg("draw")
+        .arg("-o")
+        .arg(output_path)
+        .arg("-w")
+        .arg("512")
+        .arg("-F")
+        .arg("png")
+        .arg(path)
+        .arg("1")
+        .status()
+        .is_ok_and(|status| status.success() && output_path.is_file())
+}
+
+fn run_imagemagick_renderer(path: &Path, output_path: &Path) -> bool {
+    let mut first_page = OsString::from(path.as_os_str());
+    first_page.push("[0]");
+
+    Command::new("magick")
+        .arg("-density")
+        .arg("144")
+        .arg(first_page)
+        .arg("-resize")
+        .arg("512x512")
+        .arg(output_path)
+        .status()
+        .is_ok_and(|status| status.success() && output_path.is_file())
+}
+
+fn run_ghostscript_renderer(path: &Path, output_path: &Path) -> bool {
+    ghostscript_candidates().iter().any(|candidate| {
+        Command::new(candidate)
+            .arg("-dSAFER")
+            .arg("-dBATCH")
+            .arg("-dNOPAUSE")
+            .arg("-dFirstPage=1")
+            .arg("-dLastPage=1")
+            .arg("-sDEVICE=pngalpha")
+            .arg("-dGraphicsAlphaBits=4")
+            .arg("-dTextAlphaBits=4")
+            .arg("-r144")
+            .arg(format!("-sOutputFile={}", output_path.display()))
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success() && output_path.is_file())
+    })
+}
+
+fn ghostscript_candidates() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["gswin64c", "gswin32c", "gs"]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        &["gs"]
+    }
+}
+
+fn find_generated_png(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
+}
+
 fn classify_file_kind(path: &Path) -> anyhow::Result<StoredImageKind> {
     if is_gif_file(path) {
         Ok(StoredImageKind::Gif)
     } else if is_supported_image_file(path) {
         Ok(StoredImageKind::Raster)
+    } else if is_pdf_file(path) {
+        Ok(StoredImageKind::File)
     } else if looks_like_supported_text_path(path) || file_contains_text(path)? {
         Ok(StoredImageKind::Text)
     } else {
@@ -746,6 +1009,14 @@ fn parse_clipboard_path_candidate(text: &str) -> Option<PathBuf> {
         .unwrap_or(candidate);
 
     Some(PathBuf::from(candidate))
+}
+
+fn clipboard_copy_target(record: &StoredImage) -> ClipboardCopyTarget {
+    if record.reference_path.is_some() || matches!(record.kind, StoredImageKind::File) {
+        ClipboardCopyTarget::FileList(vec![record.original_path.clone()])
+    } else {
+        ClipboardCopyTarget::ItemContents
+    }
 }
 
 fn load_records(
@@ -949,6 +1220,15 @@ fn is_gif_file(path: &Path) -> bool {
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.eq_ignore_ascii_case("gif")),
+        Some(true)
+    )
+}
+
+fn is_pdf_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("pdf")),
         Some(true)
     )
 }
@@ -1336,6 +1616,10 @@ mod tests {
             assert_eq!(store.records[0].file_extension, "bin");
             assert_eq!(store.records[0].byte_len, 5);
             assert!(input_file.exists());
+            assert_eq!(
+                clipboard_copy_target(&store.records[0]),
+                ClipboardCopyTarget::FileList(vec![store.records[0].original_path.clone()]),
+            );
 
             let reference_path = store.records[0]
                 .reference_path
@@ -1351,6 +1635,59 @@ mod tests {
             reopened.delete(0)?;
             assert!(input_file.exists());
             assert!(!reference_path.exists());
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn pdf_files_are_classified_as_files() {
+        let root = temp_store_root();
+        let result = (|| -> anyhow::Result<()> {
+            let input_file = root.join("document.pdf");
+            fs::create_dir_all(&root)?;
+            fs::write(&input_file, b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n")?;
+
+            assert_eq!(classify_file_kind(&input_file)?, StoredImageKind::File);
+
+            Ok(())
+        })();
+
+        let _ = fs::remove_dir_all(&root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn moving_record_updates_order_and_persists_on_reopen() {
+        let root = temp_store_root();
+        let result = (|| -> anyhow::Result<()> {
+            let mut store = ImageStore::open_at(root.clone())?;
+            let first = RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+            let second = RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+            let third = RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 255, 255]));
+
+            assert!(store.persist_rgba_image(first, "First")?);
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(store.persist_rgba_image(second, "Second")?);
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(store.persist_rgba_image(third, "Third")?);
+
+            assert_eq!(store.records[0].display_name, "Third");
+            assert_eq!(store.records[1].display_name, "Second");
+            assert_eq!(store.records[2].display_name, "First");
+
+            assert!(store.move_record(2, 0)?);
+            assert_eq!(store.records[0].display_name, "First");
+            assert_eq!(store.records[1].display_name, "Third");
+            assert_eq!(store.records[2].display_name, "Second");
+
+            let reopened = ImageStore::open_at(root.clone())?;
+            assert_eq!(reopened.records[0].display_name, "First");
+            assert_eq!(reopened.records[1].display_name, "Third");
+            assert_eq!(reopened.records[2].display_name, "Second");
 
             Ok(())
         })();
